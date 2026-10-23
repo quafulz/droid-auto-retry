@@ -1,0 +1,13 @@
+{
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"${DROID_PLUGIN_ROOT}/scripts/auto_continue_stop.py\"",
+          "timeout": 45
+        }
+      ]
+    }
+  ]
+}

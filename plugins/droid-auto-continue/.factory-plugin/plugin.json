@@ -1,0 +1,12 @@
+{
+  "name": "droid-auto-continue",
+  "version": "0.1.0",
+  "description": "当 Custom Model 在思考阶段静默中断、没有正文也没有工具调用时，自动从中断处继续。",
+  "author": {
+    "name": "quafulz",
+    "url": "https://github.com/quafulz"
+  },
+  "homepage": "https://github.com/quafulz/droid-auto-retry",
+  "repository": "https://github.com/quafulz/droid-auto-retry",
+  "license": "MIT"
+}

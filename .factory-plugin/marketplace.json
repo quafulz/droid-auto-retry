@@ -1,0 +1,16 @@
+{
+  "name": "droid-auto-retry",
+  "description": "Factory Droid plugin that continues a turn after a silent custom-model drop",
+  "owner": {
+    "name": "quafulz",
+    "url": "https://github.com/quafulz"
+  },
+  "plugins": [
+    {
+      "name": "droid-auto-continue",
+      "description": "Stop hook that continues when a custom model drops during thinking and emits no text or tool call",
+      "source": "./plugins/droid-auto-continue",
+      "category": "productivity"
+    }
+  ]
+}
