@@ -35,6 +35,9 @@ CONTINUATION_REASON = (
     "不要重复已经完成的写入、提交、推送、删除或其他有副作用的操作。"
 )
 NORMAL_EXIT_NOTICE = "本轮任务正常完成。"
+UNKNOWN_MODEL_NAME = "Custom Model"
+MAX_SETTINGS_BYTES = 2 * 1024 * 1024
+MAX_MODEL_NAME_CHARS = 200
 
 
 def env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -337,6 +340,110 @@ def build_reason(attempt: int, max_attempts: int) -> str:
     )
 
 
+def clean_model_name(value: str) -> str:
+    cleaned = " ".join(value.split())
+    return cleaned[:MAX_MODEL_NAME_CHARS]
+
+
+def model_id_from_message(message: dict[str, Any]) -> str | None:
+    for key in ("modelId", "model"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def name_from_model_id(model_id: str) -> str:
+    """Droid 的自定义模型 id 是 custom:<显示名>-<序号>。"""
+    body = model_id[7:] if model_id.startswith("custom:") else model_id
+    dash = body.rfind("-")
+    if dash > 0:
+        suffix = body[dash + 1 :]
+        if suffix.isdigit() and str(int(suffix)) == suffix:
+            body = body[:dash]
+    return clean_model_name(body)
+
+
+def settings_candidates(cwd: str | None) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        if path in seen:
+            return
+        seen.add(path)
+        candidates.append(path)
+
+    if isinstance(cwd, str) and cwd.strip():
+        current = Path(cwd).expanduser()
+        for _ in range(12):
+            factory = current / ".factory"
+            add(factory / "settings.local.json")
+            add(factory / "settings.json")
+            if (current / ".git").exists():
+                break
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+    home_factory = Path.home() / ".factory"
+    add(home_factory / "settings.local.json")
+    add(home_factory / "settings.json")
+    return candidates
+
+
+def custom_models(path: Path) -> list[dict[str, Any]]:
+    try:
+        if not path.is_file() or path.stat().st_size > MAX_SETTINGS_BYTES:
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    models: list[dict[str, Any]] = []
+    containers: list[Any] = [data]
+    general = data.get("general")
+    if isinstance(general, dict):
+        containers.append(general)
+    for container in containers:
+        entries = container.get("customModels")
+        if not isinstance(entries, list):
+            continue
+        models.extend(entry for entry in entries if isinstance(entry, dict))
+    return models
+
+
+def configured_display_name(model_id: str, cwd: str | None) -> str | None:
+    for path in settings_candidates(cwd):
+        for model in custom_models(path):
+            if model.get("id") != model_id:
+                continue
+            display_name = model.get("displayName")
+            if isinstance(display_name, str) and display_name.strip():
+                return clean_model_name(display_name)
+            provider_model = model.get("model")
+            if isinstance(provider_model, str) and provider_model.strip():
+                return clean_model_name(provider_model)
+    return None
+
+
+def model_display_name(message: dict[str, Any], cwd: str | None) -> str:
+    model_id = model_id_from_message(message)
+    if model_id is None:
+        return UNKNOWN_MODEL_NAME
+    configured = configured_display_name(model_id, cwd)
+    if configured:
+        return configured
+    parsed = name_from_model_id(model_id)
+    return parsed or UNKNOWN_MODEL_NAME
+
+
+def build_system_message(model_name: str, attempt: int, max_attempts: int) -> str:
+    return f"{model_name} 发生中断，正在自动重试 {attempt}/{max_attempts}..."
+
+
 def main() -> int:
     payload = read_payload()
     if payload is None or payload.get("hook_event_name") != "Stop":
@@ -345,6 +452,9 @@ def main() -> int:
     session_id = payload.get("session_id")
     stop_hook_active = payload.get("stop_hook_active")
     transcript_path = payload.get("transcript_path")
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str):
+        cwd = None
     if not isinstance(session_id, str) or not session_id.strip():
         return 0
     if not isinstance(stop_hook_active, bool):
@@ -389,7 +499,15 @@ def main() -> int:
 
     print(
         json.dumps(
-            {"decision": "block", "reason": build_reason(attempt, max_attempts)},
+            {
+                "decision": "block",
+                "reason": build_reason(attempt, max_attempts),
+                "systemMessage": build_system_message(
+                    model_display_name(message, cwd),
+                    attempt,
+                    max_attempts,
+                ),
+            },
             ensure_ascii=False,
         )
     )

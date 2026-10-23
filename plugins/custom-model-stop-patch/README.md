@@ -8,7 +8,7 @@ Factory Droid 插件。Custom Model 的流在思考阶段被掐断、界面上�
 
 只看当前会话 transcript 里最后一条 assistant 消息：
 
-- 只有 `thinking` / `reasoning`，或者正文是空白：续跑。
+- 只有 `thinking` / `reasoning`，或者正文是空白：续跑。TUI 会多一条系统消息，形如 `Hook message: APUS Private DS v4.1 Flash #2 发生中断，正在自动重试 1/4...`。`Hook message:` 是 Droid 加的前缀。模型名优先用这条 assistant 消息的 `modelId` 在 Custom Model 设置里对应的 displayName；对不上时从 id 里取出 `custom:<名字>-<序号>` 的名字。没有模型 id 时显示 `Custom Model`。
 - 已经有可见正文：不续跑。模型问问题、做完总结，都停在这里。TUI 里这条 Stop hook 下面会多一行「本轮任务正常完成。」
 - 已经发出工具调用：不续跑，交给 Droid 执行工具。
 - 出现无法识别的内容块：不续跑。

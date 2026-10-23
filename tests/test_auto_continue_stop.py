@@ -133,6 +133,7 @@ class SilentStopTests(unittest.TestCase):
         self.assertEqual(output["decision"], "block")
         self.assertIn("自动续跑 1/4", output["reason"])
         self.assertIn("不要重复已经完成", output["reason"])
+        self.assertEqual(output["systemMessage"], "Custom Model 发生中断，正在自动重试 1/4...")
 
     def test_ignores_a_visible_answer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,6 +214,72 @@ class SilentStopTests(unittest.TestCase):
             result = run_hook(payload(transcript), root / "state")
 
         self.assertIn("自动续跑 1/4", result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout)["systemMessage"],
+            "Custom Model 发生中断，正在自动重试 1/4...",
+        )
+
+    def test_system_message_uses_the_custom_model_display_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            record = assistant("drop-named", [{"type": "thinking", "thinking": "流在这里断了"}])
+            record["message"]["modelId"] = "custom:Slug Name-4"
+            write_transcript(transcript, [record])
+            settings = root / ".factory"
+            settings.mkdir()
+            (settings / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "customModels": [
+                            {
+                                "id": "custom:Slug Name-4",
+                                "displayName": "From settings.json",
+                                "apiKey": "sk-secret-should-not-leak",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (settings / "settings.local.json").write_text(
+                json.dumps(
+                    {
+                        "general": {
+                            "customModels": [
+                                {
+                                    "id": "custom:Slug Name-4",
+                                    "displayName": "Pretty Name",
+                                    "model": "secret-provider-model",
+                                    "apiKey": "sk-local-secret",
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = run_hook(payload(transcript, cwd=str(root)), root / "state")
+
+        output = json.loads(result.stdout)
+        self.assertEqual(output["systemMessage"], "Pretty Name 发生中断，正在自动重试 1/4...")
+        self.assertNotIn("sk-secret-should-not-leak", result.stdout)
+        self.assertNotIn("sk-local-secret", result.stdout)
+        self.assertNotIn("secret-provider-model", result.stdout)
+
+    def test_system_message_parses_a_custom_model_id_without_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            record = assistant("drop-parsed", [{"type": "thinking", "thinking": "断了"}])
+            record["message"]["modelId"] = "custom:Parsed Only-9"
+            write_transcript(transcript, [record])
+            result = run_hook(payload(transcript, cwd=str(root)), root / "state")
+
+        self.assertEqual(
+            json.loads(result.stdout)["systemMessage"],
+            "Parsed Only 发生中断，正在自动重试 1/4...",
+        )
 
     def test_streak_uses_stop_hook_active_and_resets_for_a_new_user_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,6 +305,9 @@ class SilentStopTests(unittest.TestCase):
         self.assertIn("自动续跑 1/4", first.stdout)
         self.assertIn("自动续跑 2/4", second.stdout)
         self.assertIn("自动续跑 1/4", reset.stdout)
+        self.assertIn("正在自动重试 1/4...", first.stdout)
+        self.assertIn("正在自动重试 2/4...", second.stdout)
+        self.assertIn("正在自动重试 1/4...", reset.stdout)
 
     def test_duplicate_assistant_message_and_attempt_cap_do_not_continue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,6 +331,7 @@ class SilentStopTests(unittest.TestCase):
                 env_updates=env,
             )
             self.assertIn("自动续跑 1/1", first.stdout)
+            self.assertIn("正在自动重试 1/1...", first.stdout)
             self.assertEqual(duplicate.stdout, "")
             self.assertEqual(capped.stdout, "")
             database = state / "streaks.sqlite3"
