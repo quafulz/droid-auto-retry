@@ -9,7 +9,7 @@ Factory Droid 插件。Custom Model 的流在思考阶段被掐断、界面上�
 只看当前会话 transcript 里最后一条 assistant 消息：
 
 - 只有 `thinking` / `reasoning`，或者正文是空白：续跑。
-- 已经有可见正文：不续跑。模型问问题、做完总结，都停在这里。
+- 已经有可见正文：不续跑。模型问问题、做完总结，都停在这里。TUI 里这条 Stop hook 下面会多一行「本轮任务正常完成。」
 - 已经发出工具调用：不续跑，交给 Droid 执行工具。
 - 出现无法识别的内容块：不续跑。
 - transcript 还没写出这条消息、路径不可读，或 Stop payload 缺字段：不续跑。

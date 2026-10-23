@@ -153,7 +153,7 @@ class SilentStopTests(unittest.TestCase):
             result = run_hook(payload(transcript), root / "state")
 
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stdout.strip(), "本轮任务正常完成。")
 
     def test_ignores_a_tool_call_without_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

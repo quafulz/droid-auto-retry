@@ -34,6 +34,7 @@ CONTINUATION_REASON = (
     "从中断处继续当前任务。先核对已经成功的修改和命令结果，"
     "不要重复已经完成的写入、提交、推送、删除或其他有副作用的操作。"
 )
+NORMAL_EXIT_NOTICE = "本轮任务正常完成。"
 
 
 def env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -135,6 +136,20 @@ def load_transcript_records(transcript_path: str) -> list[dict[str, Any]]:
 def block_text(block: dict[str, Any]) -> str:
     text = block.get("text")
     return text if isinstance(text, str) else ""
+
+
+def assistant_has_visible_text(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in TEXT_BLOCK_TYPES:
+            continue
+        if block_text(block).strip():
+            return True
+    return False
 
 
 def assistant_is_silent(message: dict[str, Any]) -> bool:
@@ -342,6 +357,8 @@ def main() -> int:
         return 0
     message = record.get("message")
     if not isinstance(message, dict) or not assistant_is_silent(message):
+        if isinstance(message, dict) and assistant_has_visible_text(message):
+            print(NORMAL_EXIT_NOTICE)
         return 0
 
     max_attempts = env_int(
