@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-PLUGIN_NAME = "droid-auto-continue"
+PLUGIN_NAME = "custom-model-stop-patch"
 DEFAULT_MAX_ATTEMPTS = 4
 MAX_MAX_ATTEMPTS = 10
 DEFAULT_BASE_DELAY_SECONDS = 2.0

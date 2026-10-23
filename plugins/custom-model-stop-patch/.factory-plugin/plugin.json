@@ -1,5 +1,5 @@
 {
-  "name": "droid-auto-continue",
+  "name": "custom-model-stop-patch",
   "version": "0.1.0",
   "description": "当 Custom Model 在思考阶段静默中断、没有正文也没有工具调用时，自动从中断处继续。",
   "author": {

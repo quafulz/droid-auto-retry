@@ -1,4 +1,4 @@
-# Droid Auto Continue
+# custom-model-stop-patch
 
 Factory Droid 插件。Custom Model 的流在思考阶段被掐断、界面上像是没报错就停住时，用 Stop hook 自动发送一次「继续」。
 
@@ -30,7 +30,7 @@ Factory Droid 插件。Custom Model 的流在思考阶段被掐断、界面上�
 
 ```bash
 droid plugin marketplace add https://github.com/quafulz/droid-auto-retry
-droid plugin install droid-auto-continue@droid-auto-retry
+droid plugin install custom-model-stop-patch@droid-auto-retry
 ```
 
 安装后新开一个会话。用 `/hooks` 确认 Stop hook 已启用。更新插件后也要新开会话，已打开的会话不会重新加载 hook。
@@ -46,7 +46,7 @@ droid plugin install droid-auto-continue@droid-auto-retry
 | `DROID_AUTO_CONTINUE_MAX_DELAY` | `15` | 单次等待上限，硬上限 40 秒 |
 | `DROID_AUTO_CONTINUE_BACKOFF_FACTOR` | `2` | 连续中断时的退避倍数，范围 `1-4` |
 | `DROID_AUTO_CONTINUE_STATE_TTL_SECONDS` | `7200` | 连续次数的过期时间 |
-| `DROID_AUTO_CONTINUE_STATE_DIR` | 空 | 状态目录。默认是 `${XDG_STATE_HOME:-~/.local/state}/droid-auto-continue` |
+| `DROID_AUTO_CONTINUE_STATE_DIR` | 空 | 状态目录。默认是 `${XDG_STATE_HOME:-~/.local/state}/custom-model-stop-patch` |
 | `DROID_AUTO_CONTINUE_TRANSCRIPT_TAIL_BYTES` | `524288` | 只读 transcript 尾部 |
 
 状态库只保存 session 和消息 id 的 SHA-256、次数和时间戳。

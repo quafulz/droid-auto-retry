@@ -7,9 +7,9 @@
   },
   "plugins": [
     {
-      "name": "droid-auto-continue",
+      "name": "custom-model-stop-patch",
       "description": "Stop hook that continues when a custom model drops during thinking and emits no text or tool call",
-      "source": "./plugins/droid-auto-continue",
+      "source": "./plugins/custom-model-stop-patch",
       "category": "productivity"
     }
   ]

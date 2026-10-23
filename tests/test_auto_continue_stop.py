@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN = ROOT / "plugins" / "droid-auto-continue"
+PLUGIN = ROOT / "plugins" / "custom-model-stop-patch"
 SCRIPT = PLUGIN / "scripts" / "auto_continue_stop.py"
 HOOKS = PLUGIN / "hooks" / "hooks.json"
 MANIFEST = PLUGIN / ".factory-plugin" / "plugin.json"
@@ -296,9 +296,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertGreaterEqual(command["timeout"], 45)
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
-        self.assertEqual(manifest["name"], "droid-auto-continue")
+        self.assertEqual(manifest["name"], "custom-model-stop-patch")
         self.assertEqual(marketplace["name"], "droid-auto-retry")
-        self.assertEqual(marketplace["plugins"][0]["source"], "./plugins/droid-auto-continue")
+        self.assertEqual(marketplace["plugins"][0]["name"], "custom-model-stop-patch")
+        self.assertEqual(marketplace["plugins"][0]["source"], "./plugins/custom-model-stop-patch")
         self.assertNotIn("PLUGIN_ROOT", command["command"].split("${DROID_PLUGIN_ROOT}")[0])
 
     def test_script_compiles(self) -> None:
