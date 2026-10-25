@@ -262,11 +262,31 @@ def text_is_compaction_summary(text: str) -> bool:
     return any(f"<{tag}>" in lowered for tag in SUMMARY_TAGS) and "</summary>" in lowered
 
 
+def text_has_open_code_fence(text: str) -> bool:
+    """只认行首的围栏，正文里引用的 ``` 不算。"""
+    open_marker = ""
+    for line in text.splitlines():
+        stripped = line.lstrip(" ")
+        if len(line) - len(stripped) > 3:
+            continue
+        fence = stripped[:3]
+        if fence not in {CODE_FENCE, "~~~"}:
+            continue
+        marker = stripped[0]
+        if not open_marker:
+            open_marker = marker
+        elif open_marker == marker:
+            open_marker = ""
+    return bool(open_marker)
+
+
 def text_is_truncated(text: str) -> bool:
-    """未闭合的代码块或摘要标签说明输出在半途被切断。"""
-    if text.count(CODE_FENCE) % 2 == 1:
+    """未闭合的代码块或摘要信封说明输出在半途被切断。"""
+    if text_has_open_code_fence(text):
         return True
-    lowered = text.lower()
+    lowered = text.lstrip().lower()
+    if not lowered.startswith(("<analysis>", "<summary>")):
+        return False
     for tag in SUMMARY_TAGS:
         if lowered.count(f"<{tag}>") > lowered.count(f"</{tag}>"):
             return True

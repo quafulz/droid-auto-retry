@@ -448,6 +448,55 @@ class UnfinishedStopTests(unittest.TestCase):
 
         self.assertEqual(result.stdout.strip(), "本轮任务正常完成。")
 
+    def test_ignores_inline_code_fences_and_tag_names_in_prose(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    assistant(
+                        "prose-1",
+                        [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "触发条件：\n"
+                                    "- 正文以 `<analysis>` / `<summary>` 包裹，属于摘要。\n"
+                                    "- 正文截断：```` ``` ```` 个数为奇数，或标签有开无闭。\n"
+                                    "- 已发出工具调用则不续跑。"
+                                ),
+                            }
+                        ],
+                    )
+                ],
+            )
+            result = run_hook(payload(transcript), root / "state")
+
+        self.assertEqual(result.stdout.strip(), "本轮任务正常完成。")
+
+    def test_ignores_a_closed_code_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    assistant(
+                        "prose-2",
+                        [
+                            {
+                                "type": "text",
+                                "text": "改法如下：\n```python\nprint('<summary>')\n```\n已提交。",
+                            }
+                        ],
+                    )
+                ],
+            )
+            result = run_hook(payload(transcript), root / "state")
+
+        self.assertEqual(result.stdout.strip(), "本轮任务正常完成。")
+
     def test_continues_when_the_text_was_cut_mid_code_block(self) -> None:
         stdout = self.run_single(
             [assistant("cut-1", [{"type": "text", "text": "结果如下：\n```python\nprint(1)"}])]
