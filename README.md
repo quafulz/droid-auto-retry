@@ -39,7 +39,9 @@ droid plugin marketplace add https://github.com/quafulz/droid-auto-retry
 droid plugin install custom-model-stop-patch@droid-auto-retry
 ```
 
-安装后新开一个会话。用 `/hooks` 确认 Stop hook 已启用。更新插件后也要新开会话，已打开的会话不会重新加载 hook。
+安装后新开一个会话，让 Droid 注册插件。用 `/hooks` 确认 Stop hook 已启用。
+
+更新已经装好的插件不用重开会话。Droid 每一轮都会重新解析插件 hook 的命令路径，`droid plugin update` 之后下一次 Stop 就会执行新装的脚本；本机实测里 `droid plugin list` 的版本号和 transcript 中 `hookCommands` 的路径都会跟着变。只有**新安装**的插件需要新开会话才会被加载。如果 `/hooks` 里看不到变化，再重开会话。
 
 ## 配置
 
