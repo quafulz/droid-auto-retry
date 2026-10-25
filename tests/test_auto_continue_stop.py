@@ -26,6 +26,7 @@ ENV_VARS = {
     "DROID_AUTO_CONTINUE_STATE_TTL_SECONDS",
     "DROID_AUTO_CONTINUE_STATE_DIR",
     "DROID_AUTO_CONTINUE_TRANSCRIPT_TAIL_BYTES",
+    "DROID_AUTO_CONTINUE_DETECT_UNFINISHED",
 }
 
 
@@ -59,6 +60,19 @@ def outcome(turn_id: str = "turn-1") -> dict[str, object]:
         "turnId": turn_id,
         "reason": "completed",
         "resultKind": "text",
+    }
+
+
+def todos(*items: tuple[str, str], record_id: str = "todo-1") -> dict[str, object]:
+    return {
+        "type": "todo_state",
+        "id": record_id,
+        "todos": {
+            "todos": [
+                {"id": str(index + 1), "status": status, "content": content}
+                for index, (content, status) in enumerate(items)
+            ]
+        },
     }
 
 
@@ -355,6 +369,135 @@ class SilentStopTests(unittest.TestCase):
         for result in [*results, raw]:
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
+
+
+class UnfinishedStopTests(unittest.TestCase):
+    def run_single(self, records: list[dict[str, object]], **extra: object) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(transcript, records)
+            result = run_hook(payload(transcript, **extra), root / "state")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_continues_when_the_turn_only_wrote_a_compaction_summary(self) -> None:
+        summary = (
+            "<analysis>\nLet me chronologically analyze this conversation.\n</analysis>\n"
+            "<summary>\n1. Read the workbook.\n2. Still writing rows.\n</summary>"
+        )
+        stdout = self.run_single(
+            [
+                user("把 Excel 改完"),
+                todos(("回写 Excel", "in_progress")),
+                assistant("tool-1", [{"type": "tool_use", "name": "Execute"}]),
+                assistant("summary-1", [{"type": "text", "text": summary}]),
+            ]
+        )
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("上下文压缩摘要", output["reason"])
+        self.assertIn("自动续跑 1/4", output["reason"])
+        self.assertEqual(output["systemMessage"], "Custom Model 任务尚未完成，正在自动续跑 1/4...")
+
+    def test_continues_when_todos_are_still_open(self) -> None:
+        stdout = self.run_single(
+            [
+                user("把 Excel 改完"),
+                todos(
+                    ("回写 Excel", "completed"),
+                    ("校验修改结果并汇报", "in_progress"),
+                    ("补充缺失章节", "pending"),
+                ),
+                assistant("text-1", [{"type": "text", "text": "已处理完主要部分。"}]),
+            ]
+        )
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("未完成项：校验修改结果并汇报；补充缺失章节。", output["reason"])
+
+    def test_stops_when_the_model_asked_the_user_a_question(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    todos(("回写 Excel", "in_progress")),
+                    assistant("ask-1", [{"type": "text", "text": "要覆盖原表还是另存一份？"}]),
+                ],
+            )
+            result = run_hook(payload(transcript), root / "state")
+
+        self.assertEqual(result.stdout.strip(), "本轮任务正常完成。")
+
+    def test_stops_when_all_todos_are_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    todos(("回写 Excel", "completed"), ("校验修改结果并汇报", "completed")),
+                    assistant("done-1", [{"type": "text", "text": "全部完成，共更新 13 行。"}]),
+                ],
+            )
+            result = run_hook(payload(transcript), root / "state")
+
+        self.assertEqual(result.stdout.strip(), "本轮任务正常完成。")
+
+    def test_continues_when_the_text_was_cut_mid_code_block(self) -> None:
+        stdout = self.run_single(
+            [assistant("cut-1", [{"type": "text", "text": "结果如下：\n```python\nprint(1)"}])]
+        )
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("被截断", output["reason"])
+
+    def test_continues_when_a_summary_tag_is_left_open(self) -> None:
+        stdout = self.run_single(
+            [assistant("cut-2", [{"type": "text", "text": "<analysis>\n还在分析"}])]
+        )
+
+        self.assertEqual(json.loads(stdout)["decision"], "block")
+
+    def test_ignores_a_text_message_that_also_calls_a_tool(self) -> None:
+        stdout = self.run_single(
+            [
+                todos(("回写 Excel", "in_progress")),
+                assistant(
+                    "tool-2",
+                    [
+                        {"type": "text", "text": "先读回工作簿。"},
+                        {"type": "tool_use", "name": "Read"},
+                    ],
+                ),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "")
+
+    def test_detect_unfinished_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    todos(("回写 Excel", "in_progress")),
+                    assistant("text-2", [{"type": "text", "text": "主要部分已处理。"}]),
+                ],
+            )
+            result = run_hook(
+                payload(transcript),
+                root / "state",
+                env_updates={"DROID_AUTO_CONTINUE_DETECT_UNFINISHED": "0"},
+            )
+
+        self.assertEqual(result.stdout.strip(), "本轮任务正常完成。")
 
 
 class PluginContractTests(unittest.TestCase):

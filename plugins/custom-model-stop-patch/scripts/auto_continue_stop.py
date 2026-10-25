@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Droid Stop hook：Custom Model 在思考阶段静默中断时，有限次自动继续。"""
+"""Droid Stop hook：回合没有真正做完时，有限次自动继续。"""
 
 from __future__ import annotations
 
@@ -28,9 +28,47 @@ MAX_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 SILENT_BLOCK_TYPES = {"thinking", "redacted_thinking", "reasoning"}
 TEXT_BLOCK_TYPES = {"text", "output_text"}
+TOOL_BLOCK_TYPES = {"tool_use", "tool_call", "server_tool_use"}
+PENDING_TODO_STATUSES = {"in_progress", "pending"}
+SUMMARY_TAGS = ("analysis", "summary")
+CODE_FENCE = "```"
+QUESTION_PHRASES = (
+    "请确认",
+    "请提供",
+    "请选择",
+    "请告知",
+    "是否需要",
+    "是否继续",
+    "要不要",
+    "需要我",
+    "可以吗",
+    "告诉我",
+    "确认一下",
+)
+MAX_TODO_LABEL_CHARS = 60
+MAX_TODO_LABELS = 5
 
-CONTINUATION_REASON = (
-    "继续。上一轮在思考阶段中断，没有输出正文，也没有发出工具调用。"
+ENDING_SILENT = "silent"
+ENDING_SUMMARY = "summary"
+ENDING_TRUNCATED = "truncated"
+ENDING_TODOS = "todos"
+ENDING_TOOL_USE = "tool_use"
+ENDING_UNKNOWN = "unknown"
+ENDING_COMPLETE = "complete"
+
+CONTINUATION_REASON = "继续。上一轮在思考阶段中断，没有输出正文，也没有发出工具调用。"
+CONTINUATION_REASONS = {
+    ENDING_SUMMARY: (
+        "继续。上一轮只输出了上下文压缩摘要（<analysis>/<summary>），"
+        "没有继续执行任务。"
+    ),
+    ENDING_TRUNCATED: (
+        "继续。上一轮正文在输出途中被截断（代码块或标签没有闭合），"
+        "不是完整答复。"
+    ),
+    ENDING_TODOS: "继续。上一条消息结束时待办列表仍有未完成项。",
+}
+CONTINUATION_TAIL = (
     "从中断处继续当前任务。先核对已经成功的修改和命令结果，"
     "不要重复已经完成的写入、提交、推送、删除或其他有副作用的操作。"
 )
@@ -141,22 +179,8 @@ def block_text(block: dict[str, Any]) -> str:
     return text if isinstance(text, str) else ""
 
 
-def assistant_has_visible_text(message: dict[str, Any]) -> bool:
-    content = message.get("content")
-    if isinstance(content, str):
-        return bool(content.strip())
-    if not isinstance(content, list):
-        return False
-    for block in content:
-        if not isinstance(block, dict) or block.get("type") not in TEXT_BLOCK_TYPES:
-            continue
-        if block_text(block).strip():
-            return True
-    return False
-
-
 def assistant_is_silent(message: dict[str, Any]) -> bool:
-    """思考块或空消息视为静默中断。正文、工具调用和未知块都不续跑。"""
+    """思考块或空消息视为静默中断。正文、工具调用和未知块都不算静默。"""
     content = message.get("content")
     if content is None:
         return True
@@ -192,6 +216,139 @@ def last_assistant_record(records: list[dict[str, Any]]) -> dict[str, Any] | Non
             return None
         return record
     return None
+
+
+def assistant_visible_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in TEXT_BLOCK_TYPES:
+            continue
+        parts.append(block_text(block))
+    return "".join(parts)
+
+
+def assistant_has_tool_use(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") in TOOL_BLOCK_TYPES for block in content
+    )
+
+
+def assistant_has_unknown_block(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    known = SILENT_BLOCK_TYPES | TEXT_BLOCK_TYPES | TOOL_BLOCK_TYPES
+    return any(
+        not isinstance(block, dict) or block.get("type") not in known for block in content
+    )
+
+
+def text_is_compaction_summary(text: str) -> bool:
+    """压缩摘要以大模型自述的 <analysis>/<summary> 包裹，不是给用户的答复。"""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if not lowered.startswith("<analysis>") and not lowered.startswith("<summary>"):
+        return False
+    return any(f"<{tag}>" in lowered for tag in SUMMARY_TAGS) and "</summary>" in lowered
+
+
+def text_is_truncated(text: str) -> bool:
+    """未闭合的代码块或摘要标签说明输出在半途被切断。"""
+    if text.count(CODE_FENCE) % 2 == 1:
+        return True
+    lowered = text.lower()
+    for tag in SUMMARY_TAGS:
+        if lowered.count(f"<{tag}>") > lowered.count(f"</{tag}>"):
+            return True
+    return False
+
+
+def text_looks_like_a_question(text: str) -> bool:
+    tail = text.strip()[-400:]
+    if not tail:
+        return False
+    stripped = tail.rstrip("`*_> \t\r\n")
+    if stripped.endswith(("?", "？")):
+        return True
+    if stripped.endswith(("。", ".", "!", "！")):
+        return False
+    return any(phrase in stripped[-120:] for phrase in QUESTION_PHRASES)
+
+
+def todo_label(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if isinstance(content, str) and content.strip():
+        label = " ".join(content.split())
+        return label[:MAX_TODO_LABEL_CHARS]
+    identifier = item.get("id")
+    return str(identifier) if identifier is not None else "未命名待办"
+
+
+def pending_todo_labels(records: list[dict[str, Any]]) -> list[str]:
+    state: dict[str, Any] | None = None
+    for record in records:
+        if record.get("type") == "todo_state":
+            state = record
+    if state is None:
+        return []
+    todos = state.get("todos")
+    if isinstance(todos, dict):
+        todos = todos.get("todos")
+    if not isinstance(todos, list):
+        return []
+    labels: list[str] = []
+    for item in todos:
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") not in PENDING_TODO_STATUSES:
+            continue
+        labels.append(todo_label(item))
+    return labels
+
+
+def classify_ending(
+    records: list[dict[str, Any]],
+    message: dict[str, Any],
+    *,
+    detect_unfinished: bool = True,
+) -> tuple[str, str]:
+    """判断这一轮是否真的结束。返回 (结论, 细节)。"""
+    if assistant_has_tool_use(message):
+        return ENDING_TOOL_USE, ""
+    if assistant_is_silent(message):
+        return ENDING_SILENT, ""
+    if assistant_has_unknown_block(message):
+        return ENDING_UNKNOWN, ""
+
+    text = assistant_visible_text(message)
+    if not text.strip():
+        return ENDING_COMPLETE, ""
+    if not detect_unfinished:
+        return ENDING_COMPLETE, ""
+    if text_is_compaction_summary(text):
+        return ENDING_SUMMARY, ""
+    if text_is_truncated(text):
+        return ENDING_TRUNCATED, ""
+    if text_looks_like_a_question(text):
+        return ENDING_COMPLETE, ""
+    labels = pending_todo_labels(records)
+    if labels:
+        shown = labels[:MAX_TODO_LABELS]
+        detail = "未完成项：" + "；".join(shown)
+        if len(labels) > len(shown):
+            detail += f" 等 {len(labels)} 项"
+        return ENDING_TODOS, detail + "。"
+    return ENDING_COMPLETE, ""
 
 
 def assistant_identity(record: dict[str, Any]) -> str:
@@ -333,11 +490,11 @@ def claim_attempt(
         connection.close()
 
 
-def build_reason(attempt: int, max_attempts: int) -> str:
-    return (
-        f"{CONTINUATION_REASON}"
-        f"这是本轮连续静默中断的自动续跑 {attempt}/{max_attempts}。"
-    )
+def build_reason(kind: str, detail: str, attempt: int, max_attempts: int) -> str:
+    head = CONTINUATION_REASONS.get(kind, CONTINUATION_REASON)
+    if detail:
+        head = f"{head}{detail}"
+    return f"{head}{CONTINUATION_TAIL}这是自动续跑 {attempt}/{max_attempts}。"
 
 
 def clean_model_name(value: str) -> str:
@@ -440,8 +597,10 @@ def model_display_name(message: dict[str, Any], cwd: str | None) -> str:
     return parsed or UNKNOWN_MODEL_NAME
 
 
-def build_system_message(model_name: str, attempt: int, max_attempts: int) -> str:
-    return f"{model_name} 发生中断，正在自动重试 {attempt}/{max_attempts}..."
+def build_system_message(model_name: str, attempt: int, max_attempts: int, kind: str) -> str:
+    if kind == ENDING_SILENT:
+        return f"{model_name} 发生中断，正在自动重试 {attempt}/{max_attempts}..."
+    return f"{model_name} 任务尚未完成，正在自动续跑 {attempt}/{max_attempts}..."
 
 
 def main() -> int:
@@ -462,13 +621,32 @@ def main() -> int:
     if not isinstance(transcript_path, str) or not transcript_path.strip():
         return 0
 
-    record = last_assistant_record(load_transcript_records(transcript_path))
+    records = load_transcript_records(transcript_path)
+    record = last_assistant_record(records)
     if record is None:
         return 0
     message = record.get("message")
-    if not isinstance(message, dict) or not assistant_is_silent(message):
-        if isinstance(message, dict) and assistant_has_visible_text(message):
-            print(NORMAL_EXIT_NOTICE)
+    if not isinstance(message, dict):
+        return 0
+
+    detect_unfinished = (
+        env_int(
+            "DROID_AUTO_CONTINUE_DETECT_UNFINISHED",
+            1,
+            minimum=0,
+            maximum=1,
+        )
+        == 1
+    )
+    kind, detail = classify_ending(
+        records,
+        message,
+        detect_unfinished=detect_unfinished,
+    )
+    if kind in {ENDING_TOOL_USE, ENDING_UNKNOWN}:
+        return 0
+    if kind == ENDING_COMPLETE:
+        print(NORMAL_EXIT_NOTICE)
         return 0
 
     max_attempts = env_int(
@@ -501,11 +679,12 @@ def main() -> int:
         json.dumps(
             {
                 "decision": "block",
-                "reason": build_reason(attempt, max_attempts),
+                "reason": build_reason(kind, detail, attempt, max_attempts),
                 "systemMessage": build_system_message(
                     model_display_name(message, cwd),
                     attempt,
                     max_attempts,
+                    kind,
                 ),
             },
             ensure_ascii=False,
