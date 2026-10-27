@@ -6,9 +6,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,7 @@ QUESTION_PHRASES = (
 )
 MAX_TODO_LABEL_CHARS = 60
 MAX_TODO_LABELS = 5
+LIST_NUMBER_PREFIX = re.compile(r"^\s*\d+[.)、．]\s*")
 
 ENDING_SILENT = "silent"
 ENDING_SUMMARY = "summary"
@@ -72,6 +75,10 @@ CONTINUATION_REASONS = {
 CONTINUATION_TAIL = (
     "从中断处继续当前任务。先核对已经成功的修改和命令结果，"
     "不要重复已经完成的写入、提交、推送、删除或其他有副作用的操作。"
+)
+TODO_RECONCILE_TAIL = (
+    "先对账：这几项如果其实已经做完，用 TodoWrite 把它们标成 completed；"
+    "如果确实还没做完，说清还缺什么再动手。"
 )
 NORMAL_EXIT_NOTICE = "本轮任务正常完成。"
 UNKNOWN_MODEL_NAME = "Custom Model"
@@ -320,16 +327,8 @@ def todo_status(item: dict[str, Any]) -> str:
     return status.strip().lower() if isinstance(status, str) else ""
 
 
-def todo_items_from_input(value: Any) -> list[dict[str, Any]] | None:
-    """只认 TodoWrite 入参里结构化的待办项。
-
-    模型把整段文本塞进 `todos` 时（例如 "1. [completed] ..." 或
-    "completed [high] ..."），Droid 会尽力解析，解析不出的状态一律落成
-    `pending`。这种状态是猜出来的，不能当作未完成的证据。
-    """
-    if not isinstance(value, dict):
-        return None
-    items = value.get("todos")
+def validated_todo_items(items: Any) -> list[dict[str, Any]] | None:
+    """每一项都带 `status` 时才认可整份列表。"""
     if not isinstance(items, list):
         return None
     result: list[dict[str, Any]] = []
@@ -340,10 +339,84 @@ def todo_items_from_input(value: Any) -> list[dict[str, Any]] | None:
     return result
 
 
-def last_todo_tool_items(records: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
-    """返回最后一处 TodoWrite 的结构化待办项；没有或不是列表时为 None。"""
-    items: list[dict[str, Any]] | None = None
-    for record in records:
+def todo_items_from_input(value: Any) -> list[dict[str, Any]] | None:
+    """只认 TodoWrite 入参里结构化的待办项。"""
+    if not isinstance(value, dict):
+        return None
+    return validated_todo_items(value.get("todos"))
+
+
+def todo_items_from_state(state: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """读出 Droid 写在 transcript 里的 todo_state 待办项。"""
+    if state.get("type") != "todo_state":
+        return None
+    todos = state.get("todos")
+    if not isinstance(todos, dict):
+        return None
+    return validated_todo_items(todos.get("todos")) or None
+
+
+def normalized_text(value: str) -> str:
+    return " ".join(value.split())
+
+
+def free_text_line_parsed(line: str, item: dict[str, Any]) -> bool:
+    """这一行是否被 Droid 真正解析过：条目的 `content` 已经脱离了原行。"""
+    content = item.get("content")
+    if not isinstance(content, str):
+        return False
+    source = normalized_text(LIST_NUMBER_PREFIX.sub("", line))
+    return bool(source) and normalized_text(content) != source
+
+
+def free_text_todo_items(
+    text: str,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """核对 Droid 是否真的解析了自由文本里的每一行。
+
+    证据只取 todo_state。但 Droid 解析不出状态时会把整行原样保留、状态落成
+    `pending`，这种 `pending` 是默认值，不是模型写的。判别不靠状态词表：
+    解析成功的那一行，`content` 一定比原行短（状态标记和序号被剥掉）；
+    解析失败的那一行，`content` 与原行只差行首序号。只要有任意一行两者相等，
+    这份清单就整份弃权。这样模型怎么写状态都不影响判定。
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or len(lines) != len(items):
+        return None
+    for line, item in zip(lines, items):
+        if not free_text_line_parsed(line, item):
+            return None
+    return items
+
+
+def todo_evidence_for_call(
+    records: list[dict[str, Any]],
+    call_index: int,
+    block: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """按 TodoWrite 的入参形态决定这一处调用能否作为待办证据。"""
+    value = block.get("input")
+    items = todo_items_from_input(value)
+    if items is not None:
+        return items
+    if not isinstance(value, dict):
+        return None
+    entries = value.get("todos")
+    if not isinstance(entries, str):
+        return None
+    for record in records[call_index + 1 :]:
+        state_items = todo_items_from_state(record)
+        if state_items is not None:
+            return free_text_todo_items(entries, state_items)
+    return None
+
+
+def iter_tool_calls(
+    records: list[dict[str, Any]],
+) -> Iterator[tuple[int, int, dict[str, Any]]]:
+    """按 transcript 顺序产出 assistant 消息里的工具调用块。"""
+    for index, record in enumerate(records):
         if record.get("type") != "message":
             continue
         message = record.get("message")
@@ -352,16 +425,49 @@ def last_todo_tool_items(records: list[dict[str, Any]]) -> list[dict[str, Any]] 
         content = message.get("content")
         if not isinstance(content, list):
             continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") not in TOOL_BLOCK_TYPES:
-                continue
-            name = block.get("name")
-            if not isinstance(name, str):
-                continue
-            if name.replace("_", "").lower() not in TODO_TOOL_NAMES:
-                continue
-            items = todo_items_from_input(block.get("input"))
-    return items
+        for position, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") in TOOL_BLOCK_TYPES:
+                yield index, position, block
+
+
+def is_todo_write(block: dict[str, Any]) -> bool:
+    name = block.get("name")
+    return isinstance(name, str) and name.replace("_", "").lower() in TODO_TOOL_NAMES
+
+
+def iter_todo_write_calls(
+    records: list[dict[str, Any]],
+) -> Iterator[tuple[int, int, dict[str, Any]]]:
+    for call in iter_tool_calls(records):
+        if is_todo_write(call[2]):
+            yield call
+
+
+def work_after_call(
+    records: list[dict[str, Any]],
+    call_index: int,
+    call_position: int,
+) -> bool:
+    """最后一次 TodoWrite 之后是否还有工具调用。
+
+    实测里模型常常先更新计划、再干完收尾的活、然后直接写总结，计划里那条
+    `in_progress` 就这么留下来了。这种计划已经过时，不能当作未完成的证据。
+    """
+    return any(
+        (index, position) > (call_index, call_position)
+        for index, position, _ in iter_tool_calls(records)
+    )
+
+
+def last_todo_tool_items(records: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """返回最后一次 TodoWrite 采信后的待办项；无证据时为 None。"""
+    calls = list(iter_todo_write_calls(records))
+    if not calls:
+        return None
+    call_index, call_position, block = calls[-1]
+    if work_after_call(records, call_index, call_position):
+        return None
+    return todo_evidence_for_call(records, call_index, block)
 
 
 def pending_todo_labels(records: list[dict[str, Any]]) -> list[str]:
@@ -553,6 +659,8 @@ def build_reason(kind: str, detail: str, attempt: int, max_attempts: int) -> str
     head = CONTINUATION_REASONS.get(kind, CONTINUATION_REASON)
     if detail:
         head = f"{head}{detail}"
+    if kind == ENDING_TODOS:
+        head = f"{head}{TODO_RECONCILE_TAIL}"
     return f"{head}{CONTINUATION_TAIL}这是自动续跑 {attempt}/{max_attempts}。"
 
 

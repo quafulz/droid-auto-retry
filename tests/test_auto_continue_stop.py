@@ -458,6 +458,48 @@ class UnfinishedStopTests(unittest.TestCase):
         output = json.loads(stdout)
         self.assertEqual(output["decision"], "block")
         self.assertIn("未完成项：校验修改结果并汇报；补充缺失章节。", output["reason"])
+        self.assertIn("先对账", output["reason"])
+        self.assertIn("标成 completed", output["reason"])
+
+    def test_ignores_an_open_todo_when_work_happened_after_the_plan_update(self) -> None:
+        """实测误报：计划里留了 in_progress，之后又跑了 55 次工具并提交，计划已过时。"""
+        stdout = self.run_single(
+            [
+                todo_write(("修复图表", "completed"), ("Run script and verify output", "in_progress")),
+                todos(("修复图表", "completed"), ("Run script and verify output", "in_progress")),
+                assistant("work-1", [{"type": "tool_use", "name": "Execute"}]),
+                user("On branch main", record_id="result-1"),
+                assistant("work-2", [{"type": "tool_use", "name": "Execute"}]),
+                assistant("done-3", [{"type": "text", "text": "已提交到 git，commit `b87b4cd`。"}]),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_ignores_a_plan_updated_in_the_same_message_as_another_tool_call(self) -> None:
+        stdout = self.run_single(
+            [
+                assistant(
+                    "mixed-1",
+                    [
+                        {
+                            "type": "tool_use",
+                            "name": "TodoWrite",
+                            "input": {
+                                "todos": [
+                                    {"id": "1", "status": "in_progress", "content": "校验结果"}
+                                ]
+                            },
+                        },
+                        {"type": "tool_use", "name": "Execute"},
+                    ],
+                ),
+                todos(("校验结果", "in_progress")),
+                assistant("done-4", [{"type": "text", "text": "跑完了，结果如上。"}]),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_stops_when_the_model_asked_the_user_a_question(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -603,6 +645,70 @@ class UnfinishedStopTests(unittest.TestCase):
             [
                 todo_write_text("in_progress [high] 校验修改结果\npending [high] 补充缺失章节"),
                 assistant("text-3", [{"type": "text", "text": "先到这里。"}]),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_uses_parsed_todo_state_when_the_model_sent_free_text(self) -> None:
+        """实测漏判：整份清单是字符串，但 Droid 已解析出每一行的状态。"""
+        stdout = self.run_single(
+            [
+                user("继续跑完校准"),
+                todo_write_text(
+                    "1. [completed] 通读方案与已有产物\n"
+                    "2. [completed] 修复 streaming 算术路径\n"
+                    "3. [in_progress] calib4 的 S1/R_full 运行中\n"
+                    "4. [pending] 填报告并给出正式判定"
+                ),
+                todos(
+                    ("通读方案与已有产物", "completed"),
+                    ("修复 streaming 算术路径", "completed"),
+                    ("calib4 的 S1/R_full 运行中", "in_progress"),
+                    ("填报告并给出正式判定", "pending"),
+                ),
+                assistant("text-open", [{"type": "text", "text": "后续动作已经挂上了自动链。"}]),
+            ]
+        )
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn(
+            "未完成项：calib4 的 S1/R_full 运行中；填报告并给出正式判定。",
+            output["reason"],
+        )
+
+    def test_abstains_when_droid_kept_a_free_text_line_verbatim(self) -> None:
+        """Droid 没认出这一行的状态时状态是默认的 pending，整份弃权。"""
+        stdout = self.run_single(
+            [
+                todo_write_text("1. [completed] 回写 Excel\n2. 校验修改结果并汇报"),
+                todos(
+                    ("回写 Excel", "completed"),
+                    ("校验修改结果并汇报", "pending"),
+                ),
+                assistant("text-verbatim", [{"type": "text", "text": "先到这里。"}]),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_abstains_when_free_text_todo_state_is_missing(self) -> None:
+        stdout = self.run_single(
+            [
+                todo_write_text("1. [in_progress] 校验修改结果"),
+                assistant("text-nostate", [{"type": "text", "text": "先到这里。"}]),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_abstains_when_free_text_line_count_does_not_match(self) -> None:
+        stdout = self.run_single(
+            [
+                todo_write_text("1. [in_progress] 校验修改结果\n2. [pending] 补充缺失章节"),
+                todos(("校验修改结果", "in_progress")),
+                assistant("text-count", [{"type": "text", "text": "先到这里。"}]),
             ]
         )
 
