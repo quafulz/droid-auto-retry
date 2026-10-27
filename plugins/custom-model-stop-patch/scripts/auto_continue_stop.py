@@ -29,6 +29,7 @@ SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 SILENT_BLOCK_TYPES = {"thinking", "redacted_thinking", "reasoning"}
 TEXT_BLOCK_TYPES = {"text", "output_text"}
 TOOL_BLOCK_TYPES = {"tool_use", "tool_call", "server_tool_use"}
+TODO_TOOL_NAMES = {"todowrite"}
 PENDING_TODO_STATUSES = {"in_progress", "pending"}
 SUMMARY_TAGS = ("analysis", "summary")
 CODE_FENCE = "```"
@@ -314,26 +315,64 @@ def todo_label(item: dict[str, Any]) -> str:
     return str(identifier) if identifier is not None else "未命名待办"
 
 
-def pending_todo_labels(records: list[dict[str, Any]]) -> list[str]:
-    state: dict[str, Any] | None = None
+def todo_status(item: dict[str, Any]) -> str:
+    status = item.get("status")
+    return status.strip().lower() if isinstance(status, str) else ""
+
+
+def todo_items_from_input(value: Any) -> list[dict[str, Any]] | None:
+    """只认 TodoWrite 入参里结构化的待办项。
+
+    模型把整段文本塞进 `todos` 时（例如 "1. [completed] ..." 或
+    "completed [high] ..."），Droid 会尽力解析，解析不出的状态一律落成
+    `pending`。这种状态是猜出来的，不能当作未完成的证据。
+    """
+    if not isinstance(value, dict):
+        return None
+    items = value.get("todos")
+    if not isinstance(items, list):
+        return None
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict) or not todo_status(item):
+            return None
+        result.append(item)
+    return result
+
+
+def last_todo_tool_items(records: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """返回最后一处 TodoWrite 的结构化待办项；没有或不是列表时为 None。"""
+    items: list[dict[str, Any]] | None = None
     for record in records:
-        if record.get("type") == "todo_state":
-            state = record
-    if state is None:
-        return []
-    todos = state.get("todos")
-    if isinstance(todos, dict):
-        todos = todos.get("todos")
-    if not isinstance(todos, list):
-        return []
-    labels: list[str] = []
-    for item in todos:
-        if not isinstance(item, dict):
+        if record.get("type") != "message":
             continue
-        if item.get("status") not in PENDING_TODO_STATUSES:
+        message = record.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        labels.append(todo_label(item))
-    return labels
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") not in TOOL_BLOCK_TYPES:
+                continue
+            name = block.get("name")
+            if not isinstance(name, str):
+                continue
+            if name.replace("_", "").lower() not in TODO_TOOL_NAMES:
+                continue
+            items = todo_items_from_input(block.get("input"))
+    return items
+
+
+def pending_todo_labels(records: list[dict[str, Any]]) -> list[str]:
+    items = last_todo_tool_items(records)
+    if not items:
+        return []
+    return [
+        todo_label(item)
+        for item in items
+        if todo_status(item) in PENDING_TODO_STATUSES
+    ]
 
 
 def classify_ending(

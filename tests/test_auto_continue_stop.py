@@ -76,6 +76,41 @@ def todos(*items: tuple[str, str], record_id: str = "todo-1") -> dict[str, objec
     }
 
 
+def todo_write(*items: tuple[str, str], record_id: str = "todo-call-1") -> dict[str, object]:
+    """模型按 TodoWrite 契约传结构化的待办列表。"""
+    return assistant(
+        record_id,
+        [
+            {
+                "type": "tool_use",
+                "id": f"{record_id}-use",
+                "name": "TodoWrite",
+                "input": {
+                    "todos": [
+                        {"id": str(index + 1), "status": status, "content": content}
+                        for index, (content, status) in enumerate(items)
+                    ]
+                },
+            }
+        ],
+    )
+
+
+def todo_write_text(text: str, record_id: str = "todo-call-2") -> dict[str, object]:
+    """模型把整段文本塞进 todos，状态由本机猜测。"""
+    return assistant(
+        record_id,
+        [
+            {
+                "type": "tool_use",
+                "id": f"{record_id}-use",
+                "name": "TodoWrite",
+                "input": {"todos": text},
+            }
+        ],
+    )
+
+
 def payload(transcript: Path, **updates: object) -> dict[str, object]:
     body: dict[str, object] = {
         "session_id": "session-1",
@@ -389,6 +424,7 @@ class UnfinishedStopTests(unittest.TestCase):
         stdout = self.run_single(
             [
                 user("把 Excel 改完"),
+                todo_write(("回写 Excel", "in_progress")),
                 todos(("回写 Excel", "in_progress")),
                 assistant("tool-1", [{"type": "tool_use", "name": "Execute"}]),
                 assistant("summary-1", [{"type": "text", "text": summary}]),
@@ -405,6 +441,11 @@ class UnfinishedStopTests(unittest.TestCase):
         stdout = self.run_single(
             [
                 user("把 Excel 改完"),
+                todo_write(
+                    ("回写 Excel", "completed"),
+                    ("校验修改结果并汇报", "in_progress"),
+                    ("补充缺失章节", "pending"),
+                ),
                 todos(
                     ("回写 Excel", "completed"),
                     ("校验修改结果并汇报", "in_progress"),
@@ -425,6 +466,7 @@ class UnfinishedStopTests(unittest.TestCase):
             write_transcript(
                 transcript,
                 [
+                    todo_write(("回写 Excel", "in_progress")),
                     todos(("回写 Excel", "in_progress")),
                     assistant("ask-1", [{"type": "text", "text": "要覆盖原表还是另存一份？"}]),
                 ],
@@ -440,6 +482,7 @@ class UnfinishedStopTests(unittest.TestCase):
             write_transcript(
                 transcript,
                 [
+                    todo_write(("回写 Excel", "completed"), ("校验修改结果并汇报", "completed")),
                     todos(("回写 Excel", "completed"), ("校验修改结果并汇报", "completed")),
                     assistant("done-1", [{"type": "text", "text": "全部完成，共更新 13 行。"}]),
                 ],
@@ -516,6 +559,7 @@ class UnfinishedStopTests(unittest.TestCase):
     def test_ignores_a_text_message_that_also_calls_a_tool(self) -> None:
         stdout = self.run_single(
             [
+                todo_write(("回写 Excel", "in_progress")),
                 todos(("回写 Excel", "in_progress")),
                 assistant(
                     "tool-2",
@@ -528,6 +572,63 @@ class UnfinishedStopTests(unittest.TestCase):
         )
 
         self.assertEqual(stdout.strip(), "")
+
+    def test_ignores_a_guessed_pending_state_when_the_tool_input_was_free_text(self) -> None:
+        """实测误解：模型把整段文本塞进 todos，本机猜成 pending，其实全都做完了。"""
+        raw = (
+            "completed [high] N0 数据清单与身份冻结\n"
+            "completed [high] N1 诊断：layout 64 层逐位一致\n"
+            "completed [high] N4 正式 G0：failed（MAE 0.0407 > 0.039）"
+        )
+        stdout = self.run_single(
+            [
+                todo_write_text(raw),
+                todos(
+                    ("completed [high] N0 数据清单与身份冻结", "pending"),
+                    ("completed [high] N1 诊断：layout 64 层逐位一致", "pending"),
+                    ("completed [high] N4 正式 G0：failed（MAE 0.0407 > 0.039）", "pending"),
+                ),
+                assistant(
+                    "done-2",
+                    [{"type": "text", "text": "无未完成事项：全量测试 134 passed。"}],
+                ),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_free_text_todo_input_is_never_read_as_unfinished_work(self) -> None:
+        """自由文本里的 in_progress/pending 只是文字，不构成未完成的证据。"""
+        stdout = self.run_single(
+            [
+                todo_write_text("in_progress [high] 校验修改结果\npending [high] 补充缺失章节"),
+                assistant("text-3", [{"type": "text", "text": "先到这里。"}]),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_ignores_a_todo_state_without_a_todo_write_call(self) -> None:
+        stdout = self.run_single(
+            [
+                todos(("回写 Excel", "in_progress"), ("补充缺失章节", "pending")),
+                assistant("text-4", [{"type": "text", "text": "已完成。"}]),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_uses_the_latest_todo_write_call(self) -> None:
+        stdout = self.run_single(
+            [
+                todo_write(("回写 Excel", "in_progress")),
+                todo_write(("回写 Excel", "completed"), record_id="todo-call-3"),
+                todos(("回写 Excel", "in_progress")),
+                assistant("text-5", [{"type": "text", "text": "已完成。"}]),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_detect_unfinished_can_be_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
