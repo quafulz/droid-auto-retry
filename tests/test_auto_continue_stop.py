@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -387,6 +388,139 @@ class SilentStopTests(unittest.TestCase):
             with sqlite3.connect(database) as connection:
                 stored = connection.execute("SELECT attempts FROM streaks").fetchone()
             self.assertEqual(stored[0], 2)
+
+    def test_streak_resets_after_real_tool_work_between_stops(self) -> None:
+        """实测：Droid 整条续跑链里 `stop_hook_active` 一直是 true。
+
+        会话里模型跑了 104 次工具之后又中断一次，仍被算成连续第 3 次，
+        第 4 次用完后真正的压缩摘要中断就不再续跑。中间干过活就不算连续。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [assistant("drop-1", [{"type": "thinking", "thinking": "一次"}])],
+            )
+            first = run_hook(payload(transcript, stop_hook_active=True), state)
+            write_transcript(
+                transcript,
+                [
+                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}]),
+                    user("继续。自动续跑 1/4。", "user-2"),
+                    assistant(
+                        "work-1",
+                        [
+                            {
+                                "type": "tool_use",
+                                "id": "call-1",
+                                "name": "Execute",
+                                "input": {"command": "pwd"},
+                            }
+                        ],
+                    ),
+                    assistant("drop-2", [{"type": "thinking", "thinking": "两次"}]),
+                ],
+            )
+            second = run_hook(payload(transcript, stop_hook_active=True), state)
+
+        self.assertIn("自动续跑 1/4", first.stdout)
+        self.assertIn("自动续跑 1/4", second.stdout)
+
+    def test_streak_keeps_counting_without_new_tool_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    assistant(
+                        "work-1",
+                        [
+                            {
+                                "type": "tool_use",
+                                "id": "call-1",
+                                "name": "Execute",
+                                "input": {"command": "pwd"},
+                            }
+                        ],
+                    ),
+                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}]),
+                ],
+            )
+            first = run_hook(payload(transcript, stop_hook_active=True), state)
+            write_transcript(
+                transcript,
+                [
+                    assistant(
+                        "work-1",
+                        [
+                            {
+                                "type": "tool_use",
+                                "id": "call-1",
+                                "name": "Execute",
+                                "input": {"command": "pwd"},
+                            }
+                        ],
+                    ),
+                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}]),
+                    user("继续。自动续跑 1/4。", "user-2"),
+                    assistant("drop-2", [{"type": "thinking", "thinking": "两次"}]),
+                ],
+            )
+            second = run_hook(payload(transcript, stop_hook_active=True), state)
+
+        self.assertIn("自动续跑 1/4", first.stdout)
+        self.assertIn("自动续跑 2/4", second.stdout)
+
+    def test_streak_reset_survives_a_state_database_without_progress_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            state.mkdir()
+            with sqlite3.connect(state / "streaks.sqlite3") as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE streaks (
+                        scope_hash TEXT PRIMARY KEY,
+                        attempts INTEGER NOT NULL,
+                        assistant_hash TEXT,
+                        last_seen INTEGER NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO streaks VALUES (?, ?, ?, ?)",
+                    (
+                        hashlib.sha256("session-1".encode("utf-8")).hexdigest(),
+                        5,
+                        "old",
+                        1,
+                    ),
+                )
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    assistant(
+                        "work-1",
+                        [
+                            {
+                                "type": "tool_use",
+                                "id": "call-1",
+                                "name": "Execute",
+                                "input": {"command": "pwd"},
+                            }
+                        ],
+                    ),
+                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}]),
+                ],
+            )
+            result = run_hook(payload(transcript, stop_hook_active=True), state)
+
+        self.assertIn("自动续跑 1/4", result.stdout)
 
     def test_fail_open_on_bad_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

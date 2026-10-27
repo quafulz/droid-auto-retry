@@ -19,7 +19,7 @@ Factory Droid 插件。Custom Model 的回合没有真正做完就停下来时�
 - 出现无法识别的内容块：不续跑。
 - transcript 还没写出这条消息、路径不可读，或 Stop payload 缺字段：不续跑。
 
-同一轮里连续自动续跑默认最多 4 次。中间一旦写出真正的正文或发出工具调用，下一轮用户消息会把次数重置。次数用完后停住，你可以再手工输入「继续」，那一次会重新开始计数。主界面不显示 thinking，所以静默中断看起来像是工具输出之后直接停住。
+同一轮里连续自动续跑默认最多 4 次。判定「连续」依据 transcript 里的最后一次工具调用：再次 Stop 时如果已经出现了新的工具调用，说明模型在两次中断之间真的干了活，连续次数从 1 重新开始计；全新的用户消息（`stop_hook_active` 为 false）同样从 1 开始。只看 `stop_hook_active` 不够：实测 Droid 在整个续跑链里始终把它置为 true，跑完 104 次工具调用之后的一次中断仍会被算成连续第 3 次，次数很快用完，之后真正的压缩摘要中断就不再续跑。所以插件自己比对 transcript 里的工具调用 id。次数用完后停住，你可以再手工输入「继续」，那一次会重新开始计数。主界面不显示 thinking，所以静默中断看起来像是工具输出之后直接停住。
 
 提问判断是文本启发式，不是语义理解。待办判断不看 assistant 正文，也不解析模型写的自由文本：它只比较「Droid 是否真的解析了每一行」这个结构事实，再读 `todo_state` 里已经成型的状态。模型如果一边说「接下来我会继续」一边结束回合，插件不会续跑；反过来，模型如果忘了把待办标成完成，可能被多续跑一次——续跑提示会先要它对账，属于这种情况时一般一轮就收住。上限 4 次保底。
 
@@ -59,7 +59,7 @@ droid plugin install custom-model-stop-patch@droid-auto-retry
 | `DROID_AUTO_CONTINUE_STATE_DIR` | 空 | 状态目录。默认是 `${XDG_STATE_HOME:-~/.local/state}/custom-model-stop-patch` |
 | `DROID_AUTO_CONTINUE_TRANSCRIPT_TAIL_BYTES` | `524288` | 只读 transcript 尾部 |
 
-状态库只保存 session 和消息 id 的 SHA-256、次数和时间戳。
+状态库只保存 session 和消息 id 的 SHA-256、次数、时间戳和最后一次工具调用的 id。
 
 ## 复核待办判据（开发用）
 

@@ -489,6 +489,26 @@ def last_todo_tool_items(records: list[dict[str, Any]]) -> list[dict[str, Any]] 
     return todo_evidence_for_call(records, call_index, block)
 
 
+def last_tool_call_marker(records: list[dict[str, Any]]) -> str:
+    """transcript 里最后一次工具调用的身份，用来判断两次中断之间有没有干活。
+
+    Droid 在整个自动续跑链里一直把 `stop_hook_active` 置为 true，光靠这个标志
+    区分不了「连续中断」和「干了很久之后又中断一次」。模型真的跑过工具，说明
+    计数该重新开始：实测一次会话里 104 次工具调用之后仍被算成连续第 3 次，
+    第 4 次用完后再中断就不续跑了。
+    """
+    marker = ""
+    for _, _, block in iter_tool_calls(records):
+        call_id = block.get("id")
+        if isinstance(call_id, str) and call_id.strip():
+            marker = "id:" + call_id.strip()
+        else:
+            marker = "digest:" + digest(
+                json.dumps(block, ensure_ascii=False, sort_keys=True, default=str)
+            )
+    return marker
+
+
 def pending_todo_labels(records: list[dict[str, Any]]) -> list[str]:
     items = last_todo_tool_items(records)
     if not items:
@@ -586,10 +606,14 @@ def connect() -> sqlite3.Connection:
                 attempts >= 0 AND attempts <= {MAX_MAX_ATTEMPTS}
             ),
             assistant_hash TEXT,
-            last_seen INTEGER NOT NULL CHECK(last_seen >= 0)
+            last_seen INTEGER NOT NULL CHECK(last_seen >= 0),
+            progress TEXT
         )
         """
     )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(streaks)")}
+    if "progress" not in columns:
+        connection.execute("ALTER TABLE streaks ADD COLUMN progress TEXT")
     connection.commit()
     return connection
 
@@ -597,6 +621,7 @@ def connect() -> sqlite3.Connection:
 def claim_attempt(
     session_id: str,
     assistant_id: str,
+    progress: str,
     *,
     stop_hook_active: bool,
     max_attempts: int,
@@ -620,11 +645,11 @@ def claim_attempt(
             (now - ttl_seconds,),
         )
         row = connection.execute(
-            "SELECT attempts, assistant_hash, last_seen FROM streaks WHERE scope_hash = ?",
+            "SELECT attempts, assistant_hash, last_seen, progress FROM streaks WHERE scope_hash = ?",
             (scope_hash,),
         ).fetchone()
         if row is not None:
-            attempts, previous_assistant, last_seen = row
+            attempts, previous_assistant, last_seen, previous_progress = row
             if (
                 type(attempts) is not int
                 or attempts < 0
@@ -632,12 +657,15 @@ def claim_attempt(
                 or (previous_assistant is not None and not isinstance(previous_assistant, str))
                 or type(last_seen) is not int
                 or last_seen < 0
+                or (previous_progress is not None and not isinstance(previous_progress, str))
             ):
                 connection.commit()
                 return None
             if previous_assistant == assistant_hash:
                 connection.commit()
                 return None
+            if progress and previous_progress != progress:
+                attempts = 0
         else:
             attempts = 0
 
@@ -645,28 +673,30 @@ def claim_attempt(
         if next_attempt > max_attempts:
             connection.execute(
                 """
-                INSERT INTO streaks (scope_hash, attempts, assistant_hash, last_seen)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO streaks (scope_hash, attempts, assistant_hash, last_seen, progress)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(scope_hash) DO UPDATE SET
                     attempts = excluded.attempts,
                     assistant_hash = excluded.assistant_hash,
-                    last_seen = excluded.last_seen
+                    last_seen = excluded.last_seen,
+                    progress = excluded.progress
                 """,
-                (scope_hash, next_attempt, assistant_hash, now),
+                (scope_hash, next_attempt, assistant_hash, now, progress),
             )
             connection.commit()
             return None
 
         connection.execute(
             """
-            INSERT INTO streaks (scope_hash, attempts, assistant_hash, last_seen)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO streaks (scope_hash, attempts, assistant_hash, last_seen, progress)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(scope_hash) DO UPDATE SET
                 attempts = excluded.attempts,
                 assistant_hash = excluded.assistant_hash,
-                last_seen = excluded.last_seen
+                last_seen = excluded.last_seen,
+                progress = excluded.progress
             """,
-            (scope_hash, next_attempt, assistant_hash, now),
+            (scope_hash, next_attempt, assistant_hash, now, progress),
         )
         connection.commit()
         return next_attempt
@@ -852,6 +882,7 @@ def main() -> int:
     attempt = claim_attempt(
         session_id,
         assistant_identity(record),
+        last_tool_call_marker(records),
         stop_hook_active=stop_hook_active,
         max_attempts=max_attempts,
         ttl_seconds=ttl_seconds,
