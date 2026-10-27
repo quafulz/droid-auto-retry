@@ -22,7 +22,16 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 HOOK_DIR = ROOT / "plugins" / "custom-model-stop-patch" / "scripts"
 DEFAULT_SESSIONS_ROOT = Path.home() / ".factory" / "sessions"
-POSITION_CHOICES = ("todos", "complete", "tool_use", "silent", "summary", "truncated", "unknown")
+POSITION_CHOICES = (
+    "todos",
+    "complete",
+    "tool_use",
+    "silent",
+    "summary",
+    "truncated",
+    "leak",
+    "unknown",
+)
 
 sys.path.insert(0, str(HOOK_DIR))
 import auto_continue_stop as hook  # noqa: E402

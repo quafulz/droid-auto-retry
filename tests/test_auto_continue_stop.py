@@ -598,6 +598,64 @@ class UnfinishedStopTests(unittest.TestCase):
 
         self.assertEqual(json.loads(stdout)["decision"], "block")
 
+    def test_continues_when_the_text_ends_with_leaked_tool_markup(self) -> None:
+        """实测漏判：正文写到一半，工具调用协议片段当成文字发了出来。"""
+        leaked = (
+            "先补一条等价性测试。\n\n"
+            "Let me write the edits.\n"
+            "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+        )
+        stdout = self.run_single([assistant("leak-1", [{"type": "text", "text": leaked}])])
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("工具调用协议", output["reason"])
+        self.assertIn("自动续跑 1/4", output["reason"])
+
+    def test_continues_when_a_function_calls_block_is_leaked(self) -> None:
+        """历史会话里的另一种形态：<invoke>/<parameter> 也当成正文发了出来。"""
+        leaked = (
+            ' 图表区", "value": "ultra-charts"}, {"label": "API 接入区", "value": "api-section"}]'
+            "</parameter>\n</invoke>\n</function_calls>"
+        )
+        stdout = self.run_single([assistant("leak-4", [{"type": "text", "text": leaked}])])
+
+        self.assertEqual(json.loads(stdout)["decision"], "block")
+
+    def test_ignores_leaked_markup_quoted_before_the_end_of_the_text(self) -> None:
+        stdout = self.run_single(
+            [
+                assistant(
+                    "leak-2",
+                    [
+                        {
+                            "type": "text",
+                            "text": "这类片段形如 `</｜DSML｜ invoke>`，以前会被漏判。已修。",
+                        }
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_ignores_leaked_markup_inside_a_code_block(self) -> None:
+        stdout = self.run_single(
+            [
+                assistant(
+                    "leak-3",
+                    [
+                        {
+                            "type": "text",
+                            "text": "复现步骤：\n```\n</｜DSML｜ invoke>\n```\n这就是当时的现场。",
+                        }
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
     def test_ignores_a_text_message_that_also_calls_a_tool(self) -> None:
         stdout = self.run_single(
             [

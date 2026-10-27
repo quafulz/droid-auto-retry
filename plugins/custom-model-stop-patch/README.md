@@ -11,6 +11,7 @@ Factory Droid 插件。Custom Model 的回合没有真正做完就停下来时�
 - 只有 `thinking` / `reasoning`，或者正文是空白：续跑。TUI 会多一条系统消息，形如 `Hook message: APUS Private DS v4.1 Flash #2 发生中断，正在自动重试 1/4...`。`Hook message:` 是 Droid 加的前缀。模型名优先用这条 assistant 消息的 `modelId` 在 Custom Model 设置里对应的 displayName；对不上时从 id 里取出 `custom:<名字>-<序号>` 的名字。没有模型 id 时显示 `Custom Model`。
 - 正文是上下文压缩摘要：续跑。自动压缩时模型会输出 `<analysis>...</analysis><summary>...</summary>`，这类消息只是摘要，不是给用户的答复。细分场景下系统消息是 `... 任务尚未完成，正在自动续跑 1/4...`。
 - 正文被截断：代码块 ` ``` ` 未闭合，或 `<analysis>` / `<summary>` 有开无闭：续跑。
+- 正文以工具调用协议片段收尾：续跑。Custom Model 偶尔把 `<｜DSML｜ ...>`、`<antml:...>` 这类片段当成正文输出，回合就此结束，工具并没有真的调用。只认落在正文末尾的标记，正文中间引用、或整段写在代码块里讨论都不会命中。
 - 待办列表仍有 `in_progress` / `pending`：续跑，`reason` 里会列出未完成项，并要求先对账（已完成的标 `completed`，还缺什么就说清）。证据只取 transcript 里 Droid 写的 `todo_state` 记录，插件不解读任何字样。这个记录有两种形态：模型按契约传结构化 `todos` 时，直接读每项的 `status`；模型把整份清单当字符串传时，Droid 可能逐行解析成带 `status` 的条目，也可能解析不出而把整行原样留下、状态落成默认的 `pending`。判别不靠状态词表，只看解析是否真的发生：解析成功的那一行，条目的 `content` 一定比原行短（状态标记和行首序号被剥掉）；解析失败的那一行，`content` 与原行只差行首序号。只要有任意一行两者相等，就说明这一行的状态是默认值，整份清单弃权。行数与条目数对不上、找不到对应的 `todo_state` 时同样弃权。此外，最后一次 `TodoWrite` 之后只要还发过工具调用，这份计划就算过时（模型常常先更新计划、再干完收尾的活、然后直接写总结），也弃权。弃权等于不续跑，因此模型怎么写待办都不会触发误判，代价是拿不到这份证据。
 - 正文以提问收尾：不续跑。末尾是 `?` / `？`，或结尾出现「请确认」「是否需要」「要不要」这类说法，视为模型在等你回答。此时即使待办未完成也停住。
 - 其他可见正文：不续跑。TUI 里这条 Stop hook 下面会多一行「本轮任务正常完成。」
@@ -50,7 +51,7 @@ droid plugin install custom-model-stop-patch@droid-auto-retry
 | 变量 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `DROID_AUTO_CONTINUE_MAX_ATTEMPTS` | `4` | `0-10`。`0` 关闭续跑 |
-| `DROID_AUTO_CONTINUE_DETECT_UNFINISHED` | `1` | `0-1`。`0` 只保留静默中断检测，忽略压缩摘要、截断和待办信号 |
+| `DROID_AUTO_CONTINUE_DETECT_UNFINISHED` | `1` | `0-1`。`0` 只保留静默中断检测，忽略压缩摘要、截断、协议泄漏和待办信号 |
 | `DROID_AUTO_CONTINUE_BASE_DELAY` | `2` | 第一次等待秒数 |
 | `DROID_AUTO_CONTINUE_MAX_DELAY` | `15` | 单次等待上限，硬上限 40 秒 |
 | `DROID_AUTO_CONTINUE_BACKOFF_FACTOR` | `2` | 连续中断时的退避倍数，范围 `1-4` |

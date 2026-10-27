@@ -35,6 +35,11 @@ TODO_TOOL_NAMES = {"todowrite"}
 PENDING_TODO_STATUSES = {"in_progress", "pending"}
 SUMMARY_TAGS = ("analysis", "summary")
 CODE_FENCE = "```"
+LEAKED_MARKUP_TAIL = re.compile(
+    r"<[／/]?(?:｜|\|)?\s*(?:DSML|antml)[^>]{0,120}>\s*$"
+    r"|<[／/]?\s*(?:function_calls|function_results)[^>]{0,120}>\s*$",
+    re.IGNORECASE,
+)
 QUESTION_PHRASES = (
     "请确认",
     "请提供",
@@ -55,6 +60,7 @@ LIST_NUMBER_PREFIX = re.compile(r"^\s*\d+[.)、．]\s*")
 ENDING_SILENT = "silent"
 ENDING_SUMMARY = "summary"
 ENDING_TRUNCATED = "truncated"
+ENDING_LEAK = "leak"
 ENDING_TODOS = "todos"
 ENDING_TOOL_USE = "tool_use"
 ENDING_UNKNOWN = "unknown"
@@ -69,6 +75,10 @@ CONTINUATION_REASONS = {
     ENDING_TRUNCATED: (
         "继续。上一轮正文在输出途中被截断（代码块或标签没有闭合），"
         "不是完整答复。"
+    ),
+    ENDING_LEAK: (
+        "继续。上一轮把工具调用协议当成了正文输出，没有真正发出工具调用，"
+        "回合在输出途中结束。"
     ),
     ENDING_TODOS: "继续。上一条消息结束时待办列表仍有未完成项。",
 }
@@ -301,6 +311,15 @@ def text_is_truncated(text: str) -> bool:
     return False
 
 
+def text_ends_with_leaked_tool_markup(text: str) -> bool:
+    """正文以工具调用协议片段收尾：模型想调工具，片段却当正文发了出来。
+
+    只认落在末尾的标记。正文中间引用这些标记，或整段写在代码块里讨论，
+    最后几个字符不是标记本身，因此不会命中。
+    """
+    return bool(LEAKED_MARKUP_TAIL.search(text))
+
+
 def text_looks_like_a_question(text: str) -> bool:
     tail = text.strip()[-400:]
     if not tail:
@@ -504,6 +523,8 @@ def classify_ending(
         return ENDING_SUMMARY, ""
     if text_is_truncated(text):
         return ENDING_TRUNCATED, ""
+    if text_ends_with_leaked_tool_markup(text):
+        return ENDING_LEAK, ""
     if text_looks_like_a_question(text):
         return ENDING_COMPLETE, ""
     labels = pending_todo_labels(records)

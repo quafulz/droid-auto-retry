@@ -1,6 +1,6 @@
 {
   "name": "custom-model-stop-patch",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "回合没有真正做完时（静默中断、压缩摘要、正文截断、待办未完成），自动从中断处继续。",
   "author": {
     "name": "quafulz",
