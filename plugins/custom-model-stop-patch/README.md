@@ -1,8 +1,8 @@
 # custom-model-stop-patch
 
-Factory Droid 插件。Custom Model 的回合没有真正做完就停下来时，用 Stop hook 自动发送「继续」。
+Factory Droid 和 Codex 插件。Custom Model 的回合没有真正做完就停下来时，用 Stop hook 自动发送「继续」。
 
-这个插件对应当前 Droid CLI 里的 Stop 行为：`decision: "block"` 会带着 `reason` 再开一轮，并把 `stop_hook_active` 设为 true。它不重放底层 HTTP 请求。
+这个插件对应当前两边的 Stop 行为：`decision: "block"` 会带着 `reason` 再开一轮，并把 `stop_hook_active` 设为 true。它不重放底层 HTTP 请求。Droid 读自己的 transcript。Codex 读 rollout 里的 `response_item`，判定结论相同。
 
 ## 什么时候会续跑
 
@@ -14,7 +14,7 @@ Factory Droid 插件。Custom Model 的回合没有真正做完就停下来时�
 - 正文以工具调用协议片段收尾：续跑。Custom Model 偶尔把 `<｜DSML｜ ...>`、`<antml:...>` 这类片段当成正文输出，回合就此结束，工具并没有真的调用。只认落在正文末尾的标记，正文中间引用、或整段写在代码块里讨论都不会命中。
 - 待办列表仍有 `in_progress` / `pending`：续跑，`reason` 里会列出未完成项，并要求先对账（已完成的标 `completed`，还缺什么就说清）。证据只取 transcript 里 Droid 写的 `todo_state` 记录，插件不解读任何字样。这个记录有两种形态：模型按契约传结构化 `todos` 时，直接读每项的 `status`；模型把整份清单当字符串传时，Droid 可能逐行解析成带 `status` 的条目，也可能解析不出而把整行原样留下、状态落成默认的 `pending`。判别不靠状态词表，只看解析是否真的发生：解析成功的那一行，条目的 `content` 一定比原行短（状态标记和行首序号被剥掉）；解析失败的那一行，`content` 与原行只差行首序号。只要有任意一行两者相等，就说明这一行的状态是默认值，整份清单弃权。行数与条目数对不上、找不到对应的 `todo_state` 时同样弃权。此外，最后一次 `TodoWrite` 之后只要还发过工具调用，这份计划就算过时（模型常常先更新计划、再干完收尾的活、然后直接写总结），也弃权。弃权等于不续跑，因此模型怎么写待办都不会触发误判，代价是拿不到这份证据。
 - 正文以提问收尾：不续跑。末尾是 `?` / `？`，或结尾出现「请确认」「是否需要」「要不要」这类说法，视为模型在等你回答。此时即使待办未完成也停住。
-- 其他可见正文：不续跑。TUI 里这条 Stop hook 下面会多一行「本轮任务正常完成。」
+- 其他可见正文：不续跑。Droid 的 TUI 里这条 Stop hook 下面会多一行「本轮任务正常完成。」Codex 把非 JSON 输出当成钩子失败，所以正常结束时什么都不打印。
 - 已经发出工具调用：不续跑，交给 Droid 执行工具。
 - 出现无法识别的内容块：不续跑。
 - transcript 还没写出这条消息、路径不可读，或 Stop payload 缺字段：不续跑。
@@ -31,22 +31,43 @@ Factory Droid 插件。Custom Model 的回合没有真正做完就停下来时�
 
 自动续跑不是事务。续跑提示要求先核对已经成功的修改和命令，再决定要不要重做。
 
+## Codex
+
+Codex 的 transcript 是 rollout。一次采样里的思考是单独的 `reasoning` 项，工具调用是 `function_call`、`local_shell_call` 等项，正文在 assistant `message` 的 `output_text` 里。插件看的是最后一条用户消息或工具结果之后的那一次采样。
+
+和 Droid 的差别：
+
+- 模型名用 Stop payload 里的 `model`，不读 `.factory/settings.json`。
+- 待办读 `update_plan`（或名为 `TodoWrite` 的函数调用）里结构化的 `plan[].step` / `status`。入参不是结构化清单时弃权。最后一次计划之后又有工具调用，同样弃权。续跑提示里要求用 `update_plan` 对账。
+- 只有 `compaction` / `context_compaction`、没有正文时，按压缩摘要续跑。
+- 正常结束不打印「本轮任务正常完成。」`systemMessage` 仍会输出，Codex 把它显示在钩子卡片上。
+- 子线程的 SubagentStop、用户取消时的 Interrupt 都不注册。
+
 ## 安装
 
-需要 Droid CLI 和 Python 3.10+（命令是 `python3`）。
+需要对应的 CLI，以及 Python 3.10+（命令是 `python3`）。
+
+Droid：
 
 ```bash
 droid plugin marketplace add https://github.com/quafulz/droid-auto-retry
 droid plugin install custom-model-stop-patch@droid-auto-retry
 ```
 
-安装后新开一个会话，让 Droid 注册插件。用 `/hooks` 确认 Stop hook 已启用。
+Codex：
 
-更新已经装好的插件不用重开会话。Droid 每一轮都会重新解析插件 hook 的命令路径，`droid plugin update` 之后下一次 Stop 就会执行新装的脚本；本机实测里 `droid plugin list` 的版本号和 transcript 中 `hookCommands` 的路径都会跟着变。只有**新安装**的插件需要新开会话才会被加载。如果 `/hooks` 里看不到变化，再重开会话。
+```bash
+codex plugin marketplace add https://github.com/quafulz/droid-auto-retry
+codex plugin add custom-model-stop-patch@droid-auto-retry
+```
+
+安装后新开一个会话。Droid 用 `/hooks` 确认 Stop hook 已启用。
+
+Droid 更新已经装好的插件不用重开会话。Droid 每一轮都会重新解析插件 hook 的命令路径，`droid plugin update` 之后下一次 Stop 就会执行新装的脚本；本机实测里 `droid plugin list` 的版本号和 transcript 中 `hookCommands` 的路径都会跟着变。只有**新安装**的插件需要新开会话才会被加载。如果 `/hooks` 里看不到变化，再重开会话。Codex 安装或更新后新开一个会话。
 
 ## 配置
 
-环境变量由启动 Droid 的进程读取。改完后完全退出并重新启动 Droid。
+环境变量由启动 Droid 或 Codex 的进程读取。改完后完全退出并重新启动对应的 CLI。
 
 | 变量 | 默认值 | 说明 |
 | --- | ---: | --- |

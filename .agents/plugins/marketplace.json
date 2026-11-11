@@ -1,0 +1,16 @@
+{
+  "name": "droid-auto-retry",
+  "description": "Stop hook that continues a turn after a silent custom-model drop",
+  "owner": {
+    "name": "quafulz",
+    "url": "https://github.com/quafulz"
+  },
+  "plugins": [
+    {
+      "name": "custom-model-stop-patch",
+      "description": "Stop hook that continues when a custom model drops during thinking and emits no text or tool call",
+      "source": "./plugins/custom-model-stop-patch",
+      "category": "productivity"
+    }
+  ]
+}

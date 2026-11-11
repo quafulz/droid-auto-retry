@@ -16,8 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "custom-model-stop-patch"
 SCRIPT = PLUGIN / "scripts" / "auto_continue_stop.py"
 HOOKS = PLUGIN / "hooks" / "hooks.json"
+CODEX_HOOKS = PLUGIN / "hooks" / "codex-hooks.json"
 MANIFEST = PLUGIN / ".factory-plugin" / "plugin.json"
+CODEX_MANIFEST = PLUGIN / ".codex-plugin" / "plugin.json"
 MARKETPLACE = ROOT / ".factory-plugin" / "marketplace.json"
+CODEX_MARKETPLACE = ROOT / ".agents" / "plugins" / "marketplace.json"
 
 ENV_VARS = {
     "DROID_AUTO_CONTINUE_MAX_ATTEMPTS",
@@ -948,6 +951,354 @@ class UnfinishedStopTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "本轮任务正常完成。")
 
 
+def codex_item(payload: dict[str, object]) -> dict[str, object]:
+    return {"type": "response_item", "payload": payload}
+
+
+def codex_user(text: str, item_id: str = "user-1") -> dict[str, object]:
+    return codex_item(
+        {
+            "type": "message",
+            "id": item_id,
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        }
+    )
+
+
+def codex_assistant(item_id: str, text: str | None) -> dict[str, object]:
+    content: list[dict[str, object]] | None
+    if text is None:
+        content = []
+    else:
+        content = [{"type": "output_text", "text": text}]
+    return codex_item(
+        {"type": "message", "id": item_id, "role": "assistant", "content": content}
+    )
+
+
+def codex_reasoning(item_id: str = "reason-1") -> dict[str, object]:
+    return codex_item(
+        {
+            "type": "reasoning",
+            "id": item_id,
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "hidden"}],
+        }
+    )
+
+
+def codex_call(call_id: str, name: str, arguments: dict[str, object]) -> dict[str, object]:
+    return codex_item(
+        {
+            "type": "function_call",
+            "id": f"fc_{call_id}",
+            "name": name,
+            "arguments": json.dumps(arguments, ensure_ascii=False),
+            "call_id": call_id,
+        }
+    )
+
+
+def codex_output(call_id: str) -> dict[str, object]:
+    return codex_item(
+        {"type": "function_call_output", "call_id": call_id, "output": "ok"}
+    )
+
+
+def codex_plan(*items: tuple[str, str], call_id: str = "plan-1") -> dict[str, object]:
+    return codex_call(
+        call_id,
+        "update_plan",
+        {
+            "plan": [
+                {"step": step, "status": status} for step, status in items
+            ]
+        },
+    )
+
+
+class CodexStopTests(unittest.TestCase):
+    def run_records(
+        self,
+        records: list[dict[str, object]],
+        *,
+        state: Path | None = None,
+        **extra: object,
+    ) -> subprocess.CompletedProcess[str]:
+        root = state.parent if state is not None else None
+        if root is None:
+            raise AssertionError("state is required")
+        transcript = root / "rollout.jsonl"
+        write_transcript(transcript, records)
+        body = payload(transcript, model="APUS Private DS v4.1 Flash #2", **extra)
+        return run_hook(body, state)
+
+    def test_continues_a_reasoning_only_stop_and_uses_the_payload_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_records(
+                [
+                    {"type": "session_meta", "payload": {"id": "session-1"}},
+                    codex_user("把 4.20 的表填上"),
+                    codex_call("call-1", "shell", {"command": "pwd"}),
+                    codex_output("call-1"),
+                    codex_reasoning("reason-drop"),
+                    {"type": "event_msg", "payload": {"type": "task_complete"}},
+                ],
+                state=root / "state",
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("自动续跑 1/4", output["reason"])
+        self.assertEqual(
+            output["systemMessage"],
+            "APUS Private DS v4.1 Flash #2 发生中断，正在自动重试 1/4...",
+        )
+
+    def test_visible_answer_prints_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_records(
+                [codex_reasoning(), codex_assistant("done-1", "表已经填好。")],
+                state=root / "state",
+            )
+
+        self.assertEqual(result.stdout, "")
+
+    def test_tool_call_without_text_does_not_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_records(
+                [codex_reasoning(), codex_call("call-2", "shell", {"command": "pwd"})],
+                state=root / "state",
+            )
+
+        self.assertEqual(result.stdout, "")
+
+    def test_blank_text_still_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_records(
+                [codex_reasoning("reason-blank"), codex_assistant("blank", "  \n")],
+                state=root / "state",
+            )
+
+        output = json.loads(result.stdout)
+        self.assertIn("发生中断，正在自动重试 1/4", output["systemMessage"])
+
+    def test_continues_a_compaction_summary_and_a_compaction_item(self) -> None:
+        summary = (
+            "<analysis>\nLet me chronologically analyze this conversation.\n</analysis>\n"
+            "<summary>\n1. Read the workbook.\n2. Still writing rows.\n</summary>"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            text = self.run_records(
+                [codex_user("把 Excel 改完"), codex_assistant("summary-1", summary)],
+                state=root / "state-text",
+            )
+            item = self.run_records(
+                [
+                    codex_user("把 Excel 改完"),
+                    codex_item(
+                        {
+                            "type": "compaction",
+                            "id": "compact-1",
+                            "encrypted_content": "secret",
+                        }
+                    ),
+                ],
+                state=root / "state-item",
+            )
+
+        text_output = json.loads(text.stdout)
+        item_output = json.loads(item.stdout)
+        self.assertIn("上下文压缩摘要", text_output["reason"])
+        self.assertIn("上下文压缩摘要", item_output["reason"])
+        self.assertIn("任务尚未完成，正在自动续跑 1/4", text_output["systemMessage"])
+        self.assertNotIn("secret", item.stdout)
+
+    def test_detect_unfinished_ignores_a_compaction_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    codex_item(
+                        {
+                            "type": "compaction",
+                            "id": "compact-2",
+                            "encrypted_content": "secret",
+                        }
+                    )
+                ],
+            )
+            result = run_hook(
+                payload(transcript, model="custom"),
+                root / "state",
+                env_updates={"DROID_AUTO_CONTINUE_DETECT_UNFINISHED": "0"},
+            )
+
+        self.assertEqual(result.stdout, "")
+
+    def test_continues_when_update_plan_still_has_open_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_records(
+                [
+                    codex_user("把 Excel 改完"),
+                    codex_plan(
+                        ("回写 Excel", "completed"),
+                        ("校验修改结果并汇报", "in_progress"),
+                        ("补充缺失章节", "pending"),
+                    ),
+                    codex_output("plan-1"),
+                    codex_assistant("text-1", "主要部分已处理。"),
+                ],
+                state=root / "state",
+            )
+
+        output = json.loads(result.stdout)
+        self.assertIn("未完成项：校验修改结果并汇报；补充缺失章节", output["reason"])
+        self.assertIn("用 update_plan 把它们标成 completed", output["reason"])
+        self.assertNotIn("TodoWrite", output["reason"])
+
+    def test_ignores_an_update_plan_after_later_tool_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_records(
+                [
+                    codex_plan(("回写 Excel", "in_progress")),
+                    codex_output("plan-1"),
+                    codex_call("call-9", "shell", {"command": "pwd"}),
+                    codex_output("call-9"),
+                    codex_assistant("text-2", "已完成。"),
+                ],
+                state=root / "state",
+            )
+
+        self.assertEqual(result.stdout, "")
+
+    def test_question_and_trailing_user_message_do_not_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            question = self.run_records(
+                [
+                    codex_plan(("回写 Excel", "in_progress")),
+                    codex_assistant("ask-1", "要不要我继续？"),
+                ],
+                state=root / "state-q",
+            )
+            trailing = self.run_records(
+                [codex_reasoning("reason-2"), codex_user("继续", "user-2")],
+                state=root / "state-u",
+            )
+
+        self.assertEqual(question.stdout, "")
+        self.assertEqual(trailing.stdout, "")
+
+    def test_unknown_content_does_not_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_records(
+                [
+                    codex_item(
+                        {
+                            "type": "message",
+                            "id": "image-1",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "看这张图。"},
+                                {"type": "input_image", "image_url": "data:image/png;base64,aa"},
+                            ],
+                        }
+                    )
+                ],
+                state=root / "state",
+            )
+
+        self.assertEqual(result.stdout, "")
+
+    def test_truncated_text_and_leaked_markup_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            truncated = self.run_records(
+                [codex_assistant("cut-1", "```python\nprint('hi')")],
+                state=root / "state-cut",
+            )
+            leaked = self.run_records(
+                [codex_assistant("leak-1", "接下来调用\n<｜DSML｜tool_calls>")],
+                state=root / "state-leak",
+            )
+
+        self.assertIn("截断", truncated.stdout)
+        self.assertIn("工具调用协议", leaked.stdout)
+
+    def test_streak_resets_after_a_new_tool_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            first = self.run_records(
+                [codex_reasoning("reason-a")],
+                state=state,
+                stop_hook_active=True,
+            )
+            second = self.run_records(
+                [
+                    codex_reasoning("reason-a"),
+                    codex_user("继续。自动续跑 1/4。", "user-hook"),
+                    codex_call("call-new", "shell", {"command": "pwd"}),
+                    codex_output("call-new"),
+                    codex_reasoning("reason-b"),
+                ],
+                state=state,
+                stop_hook_active=True,
+            )
+
+        self.assertIn("自动续跑 1/4", first.stdout)
+        self.assertIn("自动续跑 1/4", second.stdout)
+
+    def test_streak_keeps_counting_without_new_tool_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            first = self.run_records(
+                [codex_reasoning("reason-a")],
+                state=state,
+                stop_hook_active=True,
+            )
+            second = self.run_records(
+                [
+                    codex_reasoning("reason-a"),
+                    codex_user("继续。自动续跑 1/4。", "user-hook"),
+                    codex_reasoning("reason-b"),
+                ],
+                state=state,
+                stop_hook_active=True,
+            )
+
+        self.assertIn("自动续跑 1/4", first.stdout)
+        self.assertIn("自动续跑 2/4", second.stdout)
+
+    def test_unstructured_plan_arguments_do_not_continue_a_visible_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_records(
+                [
+                    codex_call("plan-bad", "update_plan", {}),
+                    codex_output("plan-bad"),
+                    codex_assistant("text-3", "已完成。"),
+                ],
+                state=root / "state",
+            )
+
+        self.assertEqual(result.stdout, "")
+
+
 class PluginContractTests(unittest.TestCase):
     def test_hooks_use_the_droid_stop_shape(self) -> None:
         hooks = json.loads(HOOKS.read_text(encoding="utf-8"))
@@ -963,6 +1314,22 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(marketplace["plugins"][0]["name"], "custom-model-stop-patch")
         self.assertEqual(marketplace["plugins"][0]["source"], "./plugins/custom-model-stop-patch")
         self.assertNotIn("PLUGIN_ROOT", command["command"].split("${DROID_PLUGIN_ROOT}")[0])
+
+        codex_hooks = json.loads(CODEX_HOOKS.read_text(encoding="utf-8"))
+        codex_command = codex_hooks["hooks"]["Stop"][0]["hooks"][0]
+        self.assertEqual(codex_command["type"], "command")
+        self.assertIn("${PLUGIN_ROOT}/scripts/auto_continue_stop.py", codex_command["command"])
+        self.assertNotIn("DROID_PLUGIN_ROOT", codex_command["command"])
+        self.assertGreaterEqual(codex_command["timeout"], 45)
+        codex_manifest = json.loads(CODEX_MANIFEST.read_text(encoding="utf-8"))
+        codex_marketplace = json.loads(CODEX_MARKETPLACE.read_text(encoding="utf-8"))
+        self.assertEqual(codex_manifest["hooks"], "./hooks/codex-hooks.json")
+        self.assertEqual(codex_manifest["name"], "custom-model-stop-patch")
+        self.assertEqual(codex_marketplace["name"], "droid-auto-retry")
+        self.assertEqual(
+            codex_marketplace["plugins"][0]["source"],
+            "./plugins/custom-model-stop-patch",
+        )
 
     def test_script_compiles(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

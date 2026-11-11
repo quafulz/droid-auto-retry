@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/auto_continue_stop.py\"",
+            "timeout": 45
+          }
+        ]
+      }
+    ]
+  }
+}

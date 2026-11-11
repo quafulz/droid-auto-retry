@@ -1,19 +1,28 @@
 # droid-auto-retry
 
-Factory Droid 插件市场。目前只有一个插件：[custom-model-stop-patch](plugins/custom-model-stop-patch/README.md)。
+Factory Droid 和 Codex 共用的插件市场。目前只有一个插件：[custom-model-stop-patch](plugins/custom-model-stop-patch/README.md)。
 
 Custom Model 的回合没有真正做完就停下来时（静默中断、压缩摘要、正文截断、待办未完成），Stop hook 会自动发送「继续」。
 
 ## 安装
 
-需要 Droid CLI 和 Python 3.10+（命令是 `python3`）。
+需要对应的 CLI，以及 Python 3.10+（命令是 `python3`）。
+
+Droid：
 
 ```bash
 droid plugin marketplace add https://github.com/quafulz/droid-auto-retry
 droid plugin install custom-model-stop-patch@droid-auto-retry
 ```
 
-安装后新开一个会话，让 Droid 注册插件。用 `/hooks` 确认 Stop hook 已启用。
+Codex：
+
+```bash
+codex plugin marketplace add https://github.com/quafulz/droid-auto-retry
+codex plugin add custom-model-stop-patch@droid-auto-retry
+```
+
+安装后新开一个会话。Droid 用 `/hooks` 确认 Stop hook 已启用。
 
 ## 文档
 

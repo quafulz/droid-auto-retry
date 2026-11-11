@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Droid Stop hook：回合没有真正做完时，有限次自动继续。"""
+"""Stop hook：回合没有真正做完时，有限次自动继续。
+
+Droid 读自己的 transcript。Codex 读 rollout 里的 response_item。
+两边的续跑结论一致：静默中断、压缩摘要、截断、协议泄漏、未完成待办会续跑。
+"""
 
 from __future__ import annotations
 
@@ -86,11 +90,22 @@ CONTINUATION_TAIL = (
     "从中断处继续当前任务。先核对已经成功的修改和命令结果，"
     "不要重复已经完成的写入、提交、推送、删除或其他有副作用的操作。"
 )
-TODO_RECONCILE_TAIL = (
-    "先对账：这几项如果其实已经做完，用 TodoWrite 把它们标成 completed；"
-    "如果确实还没做完，说清还缺什么再动手。"
-)
 NORMAL_EXIT_NOTICE = "本轮任务正常完成。"
+CODEX_TOOL_TYPES = {
+    "function_call",
+    "custom_tool_call",
+    "local_shell_call",
+    "tool_search_call",
+    "web_search_call",
+    "image_generation_call",
+}
+CODEX_PLAN_NAMES = {"updateplan", "todowrite"}
+CODEX_TEXT_BLOCK_TYPES = {"output_text", "input_text"}
+CODEX_BOUNDARY_TYPES = {
+    "additional_tools",
+    "configuration_update",
+    "compaction_trigger",
+}
 UNKNOWN_MODEL_NAME = "Custom Model"
 MAX_SETTINGS_BYTES = 2 * 1024 * 1024
 MAX_MODEL_NAME_CHARS = 200
@@ -520,6 +535,36 @@ def pending_todo_labels(records: list[dict[str, Any]]) -> list[str]:
     ]
 
 
+def format_todo_detail(labels: list[str]) -> str:
+    shown = labels[:MAX_TODO_LABELS]
+    detail = "未完成项：" + "；".join(shown)
+    if len(labels) > len(shown):
+        detail += f" 等 {len(labels)} 项"
+    return detail + "。"
+
+
+def classify_text(
+    text: str,
+    labels: list[str],
+    *,
+    detect_unfinished: bool,
+) -> tuple[str, str]:
+    """可见正文上的未完成判定。空白正文视为已经完成。"""
+    if not text.strip() or not detect_unfinished:
+        return ENDING_COMPLETE, ""
+    if text_is_compaction_summary(text):
+        return ENDING_SUMMARY, ""
+    if text_is_truncated(text):
+        return ENDING_TRUNCATED, ""
+    if text_ends_with_leaked_tool_markup(text):
+        return ENDING_LEAK, ""
+    if text_looks_like_a_question(text):
+        return ENDING_COMPLETE, ""
+    if labels:
+        return ENDING_TODOS, format_todo_detail(labels)
+    return ENDING_COMPLETE, ""
+
+
 def classify_ending(
     records: list[dict[str, Any]],
     message: dict[str, Any],
@@ -533,28 +578,11 @@ def classify_ending(
         return ENDING_SILENT, ""
     if assistant_has_unknown_block(message):
         return ENDING_UNKNOWN, ""
-
-    text = assistant_visible_text(message)
-    if not text.strip():
-        return ENDING_COMPLETE, ""
-    if not detect_unfinished:
-        return ENDING_COMPLETE, ""
-    if text_is_compaction_summary(text):
-        return ENDING_SUMMARY, ""
-    if text_is_truncated(text):
-        return ENDING_TRUNCATED, ""
-    if text_ends_with_leaked_tool_markup(text):
-        return ENDING_LEAK, ""
-    if text_looks_like_a_question(text):
-        return ENDING_COMPLETE, ""
-    labels = pending_todo_labels(records)
-    if labels:
-        shown = labels[:MAX_TODO_LABELS]
-        detail = "未完成项：" + "；".join(shown)
-        if len(labels) > len(shown):
-            detail += f" 等 {len(labels)} 项"
-        return ENDING_TODOS, detail + "。"
-    return ENDING_COMPLETE, ""
+    return classify_text(
+        assistant_visible_text(message),
+        pending_todo_labels(records),
+        detect_unfinished=detect_unfinished,
+    )
 
 
 def assistant_identity(record: dict[str, Any]) -> str:
@@ -706,12 +734,22 @@ def claim_attempt(
         connection.close()
 
 
-def build_reason(kind: str, detail: str, attempt: int, max_attempts: int) -> str:
+def build_reason(
+    kind: str,
+    detail: str,
+    attempt: int,
+    max_attempts: int,
+    *,
+    todo_tool: str = "TodoWrite",
+) -> str:
     head = CONTINUATION_REASONS.get(kind, CONTINUATION_REASON)
     if detail:
         head = f"{head}{detail}"
     if kind == ENDING_TODOS:
-        head = f"{head}{TODO_RECONCILE_TAIL}"
+        head = (
+            f"{head}先对账：这几项如果其实已经做完，用 {todo_tool} 把它们标成 completed；"
+            "如果确实还没做完，说清还缺什么再动手。"
+        )
     return f"{head}{CONTINUATION_TAIL}这是自动续跑 {attempt}/{max_attempts}。"
 
 
@@ -821,6 +859,296 @@ def build_system_message(model_name: str, attempt: int, max_attempts: int, kind:
     return f"{model_name} 任务尚未完成，正在自动续跑 {attempt}/{max_attempts}..."
 
 
+def is_codex_rollout(records: list[dict[str, Any]]) -> bool:
+    return any(record.get("type") == "response_item" for record in records)
+
+
+def codex_payloads(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("type") != "response_item":
+            continue
+        payload = record.get("payload")
+        payloads.append(payload if isinstance(payload, dict) else {"type": "__invalid__"})
+    return payloads
+
+
+def is_codex_boundary(payload: dict[str, Any]) -> bool:
+    """用户消息和工具结果把模型的一次采样隔开。"""
+    kind = payload.get("type")
+    if not isinstance(kind, str):
+        return False
+    if kind == "message":
+        return payload.get("role") != "assistant"
+    if kind.endswith("_output"):
+        return True
+    return kind in CODEX_BOUNDARY_TYPES
+
+
+def codex_last_step(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """最后一次采样：最后一条用户消息或工具结果之后的模型输出。"""
+    known = CODEX_TOOL_TYPES | {"reasoning", "message", "compaction", "context_compaction"}
+    step: list[dict[str, Any]] = []
+    for payload in payloads:
+        if is_codex_boundary(payload):
+            step = []
+            continue
+        kind = payload.get("type")
+        if kind == "message" and payload.get("role") == "assistant":
+            step.append(payload)
+            continue
+        if kind in known:
+            step.append(payload)
+            continue
+        step.append({"type": "__unknown__"})
+    return step
+
+
+def codex_message_parts(payload: dict[str, Any]) -> tuple[str, bool]:
+    content = payload.get("content")
+    if content is None:
+        return "", False
+    if isinstance(content, str):
+        return content, False
+    if not isinstance(content, list):
+        return "", True
+    parts: list[str] = []
+    unknown = False
+    for block in content:
+        if not isinstance(block, dict):
+            unknown = True
+            continue
+        if block.get("type") not in CODEX_TEXT_BLOCK_TYPES:
+            unknown = True
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts), unknown
+
+
+def normalized_tool_name(value: str) -> str:
+    leaf = value.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[-1]
+    return leaf.replace("_", "").replace("-", "").lower()
+
+
+def codex_call_arguments(payload: dict[str, Any]) -> Any:
+    raw = payload.get("arguments") if "arguments" in payload else payload.get("input")
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    return raw
+
+
+def codex_plan_items(value: Any) -> list[dict[str, Any]] | None:
+    """Codex 的 update_plan 用 plan[].step；也接受已经是 todos[].content 的入参。"""
+    if not isinstance(value, dict):
+        return None
+    plan = value.get("plan")
+    if isinstance(plan, list):
+        items: list[dict[str, Any]] = []
+        for entry in plan:
+            if not isinstance(entry, dict):
+                return None
+            label = entry.get("step")
+            if not isinstance(label, str) or not label.strip():
+                label = entry.get("content")
+            status = entry.get("status")
+            if not isinstance(label, str) or not label.strip():
+                return None
+            if not isinstance(status, str) or not status.strip():
+                return None
+            items.append({"content": label, "status": status})
+        return items
+    if "todos" in value:
+        return validated_todo_items(value.get("todos"))
+    return None
+
+
+def codex_pending_labels(payloads: list[dict[str, Any]]) -> list[str]:
+    """最后一次结构化 update_plan。之后又有工具调用则计划过时，弃权。"""
+    last_index: int | None = None
+    last_items: list[dict[str, Any]] | None = None
+    for index, payload in enumerate(payloads):
+        if payload.get("type") not in {"function_call", "custom_tool_call"}:
+            continue
+        name = payload.get("name")
+        if not isinstance(name, str) or normalized_tool_name(name) not in CODEX_PLAN_NAMES:
+            continue
+        last_index = index
+        last_items = codex_plan_items(codex_call_arguments(payload))
+    if last_index is None or not last_items:
+        return []
+    if any(payload.get("type") in CODEX_TOOL_TYPES for payload in payloads[last_index + 1 :]):
+        return []
+    return [
+        todo_label(item)
+        for item in last_items
+        if todo_status(item) in PENDING_TODO_STATUSES
+    ]
+
+
+def classify_codex(
+    payloads: list[dict[str, Any]],
+    *,
+    detect_unfinished: bool,
+) -> tuple[str, str] | None:
+    """把 Codex 最后一次采样收成和 Droid 相同的结论。没有模型输出时返回 None。"""
+    step = codex_last_step(payloads)
+    if not step:
+        return None
+    if any(item.get("type") == "__unknown__" for item in step):
+        return ENDING_UNKNOWN, ""
+    if any(item.get("type") in CODEX_TOOL_TYPES for item in step):
+        return ENDING_TOOL_USE, ""
+
+    texts: list[str] = []
+    unknown = False
+    saw_assistant = False
+    saw_reasoning = False
+    saw_compaction = False
+    for item in step:
+        kind = item.get("type")
+        if kind == "reasoning":
+            saw_reasoning = True
+        elif kind in {"compaction", "context_compaction"}:
+            saw_compaction = True
+        elif kind == "message":
+            saw_assistant = True
+            text, bad = codex_message_parts(item)
+            texts.append(text)
+            unknown = unknown or bad
+    if unknown:
+        return ENDING_UNKNOWN, ""
+    text = "".join(texts)
+    if text.strip():
+        return classify_text(
+            text,
+            codex_pending_labels(payloads),
+            detect_unfinished=detect_unfinished,
+        )
+    if saw_compaction and not saw_reasoning and not saw_assistant:
+        if not detect_unfinished:
+            return ENDING_COMPLETE, ""
+        return ENDING_SUMMARY, ""
+    if saw_reasoning or saw_assistant or saw_compaction:
+        return ENDING_SILENT, ""
+    return None
+
+
+def codex_step_identity(step: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for item in step:
+        found = False
+        for key in ("id", "call_id"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+                found = True
+                break
+        if not found:
+            parts.append(
+                digest(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str))
+            )
+    return "\n".join(parts)
+
+
+def codex_tool_marker(payloads: list[dict[str, Any]]) -> str:
+    marker = ""
+    for payload in payloads:
+        if payload.get("type") not in CODEX_TOOL_TYPES:
+            continue
+        call_id = payload.get("call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            call_id = payload.get("id")
+        if isinstance(call_id, str) and call_id.strip():
+            marker = "id:" + call_id.strip()
+        else:
+            marker = "digest:" + digest(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+            )
+    return marker
+
+
+def codex_model_name(stop_payload: dict[str, Any]) -> str:
+    model = stop_payload.get("model")
+    if isinstance(model, str) and model.strip():
+        return clean_model_name(model)
+    return UNKNOWN_MODEL_NAME
+
+
+def finish_classified(
+    *,
+    session_id: str,
+    stop_hook_active: bool,
+    kind: str,
+    detail: str,
+    assistant_id: str,
+    progress: str,
+    model_name: str,
+    announce_complete: bool,
+    todo_tool: str,
+) -> int:
+    if kind in {ENDING_TOOL_USE, ENDING_UNKNOWN}:
+        return 0
+    if kind == ENDING_COMPLETE:
+        if announce_complete:
+            print(NORMAL_EXIT_NOTICE)
+        return 0
+
+    max_attempts = env_int(
+        "DROID_AUTO_CONTINUE_MAX_ATTEMPTS",
+        DEFAULT_MAX_ATTEMPTS,
+        minimum=0,
+        maximum=MAX_MAX_ATTEMPTS,
+    )
+    ttl_seconds = env_int(
+        "DROID_AUTO_CONTINUE_STATE_TTL_SECONDS",
+        DEFAULT_STATE_TTL_SECONDS,
+        minimum=300,
+        maximum=7 * 24 * 60 * 60,
+    )
+    attempt = claim_attempt(
+        session_id,
+        assistant_id,
+        progress,
+        stop_hook_active=stop_hook_active,
+        max_attempts=max_attempts,
+        ttl_seconds=ttl_seconds,
+    )
+    if attempt is None:
+        return 0
+
+    delay = delay_seconds(attempt)
+    if delay > 0:
+        time.sleep(delay)
+
+    print(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": build_reason(
+                    kind,
+                    detail,
+                    attempt,
+                    max_attempts,
+                    todo_tool=todo_tool,
+                ),
+                "systemMessage": build_system_message(
+                    model_name,
+                    attempt,
+                    max_attempts,
+                    kind,
+                ),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def main() -> int:
     payload = read_payload()
     if payload is None or payload.get("hook_event_name") != "Stop":
@@ -840,13 +1168,6 @@ def main() -> int:
         return 0
 
     records = load_transcript_records(transcript_path)
-    record = last_assistant_record(records)
-    if record is None:
-        return 0
-    message = record.get("message")
-    if not isinstance(message, dict):
-        return 0
-
     detect_unfinished = (
         env_int(
             "DROID_AUTO_CONTINUE_DETECT_UNFINISHED",
@@ -856,60 +1177,47 @@ def main() -> int:
         )
         == 1
     )
+    if is_codex_rollout(records):
+        payloads = codex_payloads(records)
+        classified = classify_codex(payloads, detect_unfinished=detect_unfinished)
+        if classified is None:
+            return 0
+        kind, detail = classified
+        return finish_classified(
+            session_id=session_id,
+            stop_hook_active=stop_hook_active,
+            kind=kind,
+            detail=detail,
+            assistant_id=codex_step_identity(codex_last_step(payloads)),
+            progress=codex_tool_marker(payloads),
+            model_name=codex_model_name(payload),
+            announce_complete=False,
+            todo_tool="update_plan",
+        )
+
+    record = last_assistant_record(records)
+    if record is None:
+        return 0
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return 0
+
     kind, detail = classify_ending(
         records,
         message,
         detect_unfinished=detect_unfinished,
     )
-    if kind in {ENDING_TOOL_USE, ENDING_UNKNOWN}:
-        return 0
-    if kind == ENDING_COMPLETE:
-        print(NORMAL_EXIT_NOTICE)
-        return 0
-
-    max_attempts = env_int(
-        "DROID_AUTO_CONTINUE_MAX_ATTEMPTS",
-        DEFAULT_MAX_ATTEMPTS,
-        minimum=0,
-        maximum=MAX_MAX_ATTEMPTS,
-    )
-    ttl_seconds = env_int(
-        "DROID_AUTO_CONTINUE_STATE_TTL_SECONDS",
-        DEFAULT_STATE_TTL_SECONDS,
-        minimum=300,
-        maximum=7 * 24 * 60 * 60,
-    )
-    attempt = claim_attempt(
-        session_id,
-        assistant_identity(record),
-        last_tool_call_marker(records),
+    return finish_classified(
+        session_id=session_id,
         stop_hook_active=stop_hook_active,
-        max_attempts=max_attempts,
-        ttl_seconds=ttl_seconds,
+        kind=kind,
+        detail=detail,
+        assistant_id=assistant_identity(record),
+        progress=last_tool_call_marker(records),
+        model_name=model_display_name(message, cwd),
+        announce_complete=True,
+        todo_tool="TodoWrite",
     )
-    if attempt is None:
-        return 0
-
-    delay = delay_seconds(attempt)
-    if delay > 0:
-        time.sleep(delay)
-
-    print(
-        json.dumps(
-            {
-                "decision": "block",
-                "reason": build_reason(kind, detail, attempt, max_attempts),
-                "systemMessage": build_system_message(
-                    model_display_name(message, cwd),
-                    attempt,
-                    max_attempts,
-                    kind,
-                ),
-            },
-            ensure_ascii=False,
-        )
-    )
-    return 0
 
 
 if __name__ == "__main__":
