@@ -43,6 +43,47 @@ Codex 的 transcript 是 rollout。一次采样里的思考是单独的 `reasoni
 - 正常结束不打印「本轮任务正常完成。」`systemMessage` 仍会输出，Codex 把它显示在钩子卡片上。
 - 子线程的 SubagentStop、用户取消时的 Interrupt 都不注册。
 
+### API 失败（429、5xx、流中断）
+
+这是 Codex 侧最容易漏掉的一类中断：**采样请求在 API 层失败时，Codex 不发 Stop，也不发任何其它回合结束事件**。`core/src/session/turn.rs` 里的重试循环在错误分支直接结束回合，`run_turn_stop_hooks` 只挂在正常收尾的路径上。钩子消费方会看到「用户提交了提示词，然后什么都没有」，误以为会话还在忙。
+
+Codex 唯一能观测到这类失败的是 `PostModelRequest`：它是观察型钩子，失败时带 `status: "failed"` 和 `error` 文本，输出只被写进日志、不参与控制流。插件注册了它，拿到失败后：
+
+1. 判断这个失败是否值得重试。只认限流、5xx、连接中断；认证失败、上下文超限、配额、内容策略这些终态错误一律不碰——重试只会重复失败还白等。
+2. 按指数退避等待：默认 5 秒起，每次乘 2，封顶 40 秒。等待不占 Codex 自己的重试预算。
+3. 拉起 `codex exec resume <session_id>`，把一条对账指令作为新一轮输入送进同一会话。
+
+**为什么不直接重新发请求**：Codex 没有这个入口。`turn/start` 虽然接受空 `input`，但没有 CLI 或 app-server 方法让外部进程触发「零消息重采样」；`ContinueIfIdle` 那种空唤醒只在内部恢复路径（`daemon_continuation.rs`）使用。所以续跑必然要带一条消息。指令写成对账式，先核对已完成的修改再继续，避免重做有副作用的操作。
+
+**为什么要自己等**：Codex 自己的重试基数是 200ms（`async-utils/src/backoff.rs`），默认最多 4 次请求 + 5 次流重连，总窗口约 3 秒，对 429 的限流窗口远远不够。它还有一个 `unbounded_connection_retries`（默认开启），但只覆盖 `ConnectionFailed`，不含 429。
+
+**为什么要脱离 hook 进程**：退避和等锁都在一个独立的后台进程里做。原因有两个。
+
+其一，hook 有自己的超时，睡在 hook 里会挤占 Codex 的收尾时间。
+
+其二，也是更关键的：插件在 `PostModelRequest` 里运行时，发起回合的 Codex 进程**仍然持有该会话的写锁**（实测 `PostModelRequest` 执行期间 `thread-writer-locks/<session>.lock` 是 HELD，进程退出才释放）。此时直接 `codex exec resume` 必定报 `already has an active writer`。后台进程轮询共享锁等到释放那一瞬间再续跑，默认最多等 180 秒。
+
+**为什么要还原启动参数**：`codex exec resume` 是**新进程**，只从 `config.toml` 和自身参数取值。原进程那些只存在于命令行的设置会全部丢掉，实测有两类后果：
+
+1. 自定义 provider（很多网关的启动脚本这么写）丢失，报 `model provider is no longer configured`。
+2. **沙箱静默降级**：原进程用 `-s danger-full-access` 启动时，续跑进程会退回默认的 `read-only`，模型接着写文件、跑命令全部失败。
+
+插件往上找最近的 codex 进程，把它的 `-c` / `--profile` / `-s` / `--sandbox` / `--ask-for-approval` / `--dangerously-bypass-approvals-and-sandbox` 全部还原。`codex exec resume` 不接受 `-s/--sandbox`，所以沙箱换成等价的 `-c sandbox_mode="..."`。
+
+覆盖必须在 **hook 进程内**算好再传给后台进程——后台进程跑起来时 hook 已退出，父进程已经换人，那时再算什么都拿不到（这个坑实测踩过）。
+
+读取原进程命令行分平台：
+
+| 平台 | 方式 | 说明 |
+| --- | --- | --- |
+| Linux | `/proc/<pid>/cmdline` | NUL 分隔的原始字节 |
+| macOS | `sysctl(KERN_PROCARGS2)` | 通过 `ctypes` 调用；NUL 分隔的原始字节 |
+| Windows | 无 | 退化成只用 `config.toml` |
+
+macOS 这一档**不能**用 `ps -o args=`。它把 argv 用空格拼成一行，参数内部的空格无法还原。`apus_codex.sh` 传的就是 `-c 'model_providers.azure-openai={name="Azure OpenAI",...}'`，按空格切会得到 `name="Azure` 和 `OpenAI",...}` 两段，续跑进程拿到一个坏掉的 provider 定义。`KERN_PROCARGS2` 返回的是原始字节，能精确还原每一个参数。
+
+**已知限制**：TUI 场景下发起回合的 TUI 会一直活着（默认空闲 60 秒才释放写锁，`thread_unload_delay_secs`），等待窗口内能不能抢到取决于 TUI 何时让出。等不到就放手，不给用户留下一个挂着的后台进程——这种情况需要手工输入「继续」。`codex exec` 这类一次性进程退出很快，基本都能等到。Windows 上因为读不到命令行，只有把 provider 写在 `config.toml` 里才能续跑成功。
+
 ## 安装
 
 需要对应的 CLI，以及 Python 3.10+（命令是 `python3`）。
@@ -79,6 +120,11 @@ Droid 更新已经装好的插件不用重开会话。Droid 每一轮都会重�
 | `DROID_AUTO_CONTINUE_STATE_TTL_SECONDS` | `7200` | 连续次数的过期时间 |
 | `DROID_AUTO_CONTINUE_STATE_DIR` | 空 | 状态目录。默认是 `${XDG_STATE_HOME:-~/.local/state}/custom-model-stop-patch` |
 | `DROID_AUTO_CONTINUE_TRANSCRIPT_TAIL_BYTES` | `524288` | 只读 transcript 尾部 |
+| `DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS` | `4` | `0-10`。API 失败后续跑的次数，`0` 关闭 |
+| `DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY` | `5` | API 失败后的第一次等待秒数 |
+| `DROID_AUTO_CONTINUE_FAILURE_MAX_DELAY` | `40` | API 失败后的单次等待上限，硬上限 40 秒 |
+
+`DROID_AUTO_CONTINUE_BACKOFF_FACTOR` 同时用于这两条退避路径。
 
 状态库只保存 session 和消息 id 的 SHA-256、次数、时间戳和最后一次工具调用的 id。
 

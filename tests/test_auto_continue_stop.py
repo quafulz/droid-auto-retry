@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -31,6 +34,9 @@ ENV_VARS = {
     "DROID_AUTO_CONTINUE_STATE_DIR",
     "DROID_AUTO_CONTINUE_TRANSCRIPT_TAIL_BYTES",
     "DROID_AUTO_CONTINUE_DETECT_UNFINISHED",
+    "DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS",
+    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY",
+    "DROID_AUTO_CONTINUE_FAILURE_MAX_DELAY",
 }
 
 
@@ -1299,6 +1305,396 @@ class CodexStopTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
 
 
+class FailureHookTests(unittest.TestCase):
+    """Codex 在 API 层失败时只发 PostModelRequest，不发 Stop。"""
+
+    def run_failure(
+        self,
+        state: Path,
+        *,
+        error: object = "exceeded retry limit, last status: 429 Too Many Requests",
+        status: object = "failed",
+        **overrides: object,
+    ) -> subprocess.CompletedProcess[str]:
+        body: dict[str, object] = {
+            "hook_event_name": "PostModelRequest",
+            "session_id": "session-failure-1",
+            "turn_id": "turn-failure-1",
+            "cwd": str(ROOT),
+            "model": "APUS Private DS v4.1 Flash #2",
+            "status": status,
+            "error": error,
+            "token_usage": None,
+        }
+        body.update(overrides)
+        return run_hook(body, state)
+
+    def test_retryable_failure_spawns_a_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root / "calls.jsonl"
+            fake = root / "codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            result = run_hook(
+                {
+                    "hook_event_name": "PostModelRequest",
+                    "session_id": "session-failure-1",
+                    "cwd": str(root),
+                    "model": "test-model",
+                    "status": "failed",
+                    "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                },
+                root / "state",
+                env_updates={
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                },
+            )
+            for _ in range(100):
+                if calls.exists() and calls.read_text(encoding="utf-8").strip():
+                    break
+                time.sleep(0.05)
+            recorded = [
+                json.loads(line)
+                for line in calls.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(recorded), 1)
+        argv = recorded[0]
+        self.assertEqual(argv[:3], ["exec", "resume", "--skip-git-repo-check"])
+        self.assertIn("session-failure-1", argv)
+        self.assertTrue(argv[-1].startswith("继续。"))
+        self.assertIn("systemMessage", json.loads(result.stdout))
+
+    def test_non_retryable_failures_do_not_spawn(self) -> None:
+        cases = {
+            "unauthorized": "401 Unauthorized",
+            "quota": "Your quota has been exceeded",
+            "context": "This model's maximum context length is 128000 tokens",
+        }
+        for name, message in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                calls = root / "calls.jsonl"
+                fake = root / "codex"
+                fake.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, sys\n"
+                    f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
+                    encoding="utf-8",
+                )
+                fake.chmod(0o755)
+                result = run_hook(
+                    {
+                        "hook_event_name": "PostModelRequest",
+                        "session_id": "session-failure-1",
+                        "cwd": str(root),
+                        "status": "failed",
+                        "error": message,
+                    },
+                    root / "state",
+                    env_updates={
+                        "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                        "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                    },
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(calls.exists())
+
+    def test_completed_model_request_does_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.run_failure(root / "state", status="completed", error=None)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_the_same_failure_is_not_retried_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root / "calls.jsonl"
+            fake = root / "codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            env = {
+                "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+            }
+            results = [
+                run_hook(
+                    {
+                        "hook_event_name": "PostModelRequest",
+                        "session_id": "session-failure-1",
+                        "cwd": str(root),
+                        "status": "failed",
+                        "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                    },
+                    root / "state",
+                    env_updates=env,
+                )
+                for _ in range(3)
+            ]
+            for _ in range(100):
+                if calls.exists():
+                    break
+                time.sleep(0.05)
+            time.sleep(0.2)
+            lines = [
+                line
+                for line in calls.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ] if calls.exists() else []
+
+        self.assertEqual([r.returncode for r in results], [0, 0, 0])
+        self.assertEqual(len(lines), 1)
+        self.assertEqual([r.stdout for r in results[1:]], ["", ""])
+
+
+class ResumeHelperTests(unittest.TestCase):
+    """后台辅助进程：先退避、等写锁释放，再续跑。"""
+
+    def run_helper(
+        self,
+        *args: str,
+        env_updates: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        for name in ENV_VARS:
+            env.pop(name, None)
+        if env_updates:
+            env.update(env_updates)
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--resume-after-lock", *args],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            env=env,
+            timeout=120,
+        )
+
+    def test_helper_resumes_once_the_lock_is_free(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root / "calls.jsonl"
+            fake = root / "codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            home = root / "codex-home"
+            (home / "thread-writer-locks").mkdir(parents=True)
+            result = self.run_helper(
+                "session-helper-1",
+                str(root),
+                "0",
+                json.dumps(
+                    ["-c", "model_provider=fake", "-c", 'sandbox_mode="danger-full-access"']
+                ),
+                env_updates={
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "CODEX_HOME": str(home),
+                },
+            )
+            recorded = [
+                json.loads(line)
+                for line in calls.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0][:2], ["exec", "resume"])
+        self.assertIn("--skip-git-repo-check", recorded[0])
+        self.assertIn("session-helper-1", recorded[0])
+        # hook 进程算好的覆盖必须原样带到续跑命令里。
+        self.assertIn("model_provider=fake", recorded[0])
+        self.assertIn('sandbox_mode="danger-full-access"', recorded[0])
+
+    def test_helper_waits_while_the_writer_lock_is_held(self) -> None:
+        """锁被占用时不能直接续跑，必须等到释放。"""
+        fcntl = __import__("fcntl")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root / "calls.jsonl"
+            fake = root / "codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            home = root / "codex-home"
+            locks = home / "thread-writer-locks"
+            locks.mkdir(parents=True)
+            lock_path = locks / "session-helper-2.lock"
+            holder = lock_path.open("wb")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--resume-after-lock",
+                    "session-helper-2",
+                    str(root),
+                    "0",
+                    "[]",
+                ],
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "CODEX_HOME": str(home),
+                },
+            )
+            try:
+                # 锁还握着的时候不能有续跑。
+                time.sleep(2.5)
+                self.assertFalse(calls.exists(), "helper resumed while the lock was held")
+                fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                holder.close()
+                proc.communicate(timeout=60)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+                if not holder.closed:
+                    holder.close()
+
+            recorded = [
+                json.loads(line)
+                for line in calls.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(len(recorded), 1)
+
+
+class ProcessArgvTests(unittest.TestCase):
+    """续跑要还原原进程命令行，必须精确拿到 argv。"""
+
+    def load(self):
+        spec = importlib.util.spec_from_file_location("ac", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_parses_macos_procargs_buffer_without_splitting_on_spaces(self) -> None:
+        module = self.load()
+        argv = [
+            "/usr/local/bin/codex",
+            "-c",
+            'model_providers.azure-openai={name="Azure OpenAI",'
+            'base_url="https://coding.apuscn.com/v1",wire_api="responses"}',
+            "-c",
+            "model=deepseek-ai/DeepSeek-V4.1-Flash",
+            "--sandbox",
+            "danger-full-access",
+        ]
+        buffer = struct.pack("<i", len(argv))
+        buffer += b"/usr/local/bin/codex\0"
+        buffer += b"\0" * 12
+        buffer += b"\0".join(arg.encode() for arg in argv) + b"\0"
+        buffer += b"PATH=/usr/bin\0HOME=/Users/x\0"
+
+        parsed = module.parse_procargs2(buffer)
+
+        self.assertEqual(parsed, argv)
+        # 这一条是整个 macOS 支持的关键：带空格的参数不能被拆开。
+        self.assertEqual(
+            parsed[2],
+            'model_providers.azure-openai={name="Azure OpenAI",'
+            'base_url="https://coding.apuscn.com/v1",wire_api="responses"}',
+        )
+
+    def test_rejects_malformed_procargs_buffers(self) -> None:
+        module = self.load()
+        self.assertEqual(module.parse_procargs2(b""), [])
+        self.assertEqual(module.parse_procargs2(b"\x01"), [])
+        # argc 为 0 或负数不可信
+        self.assertEqual(module.parse_procargs2(struct.pack("<i", 0) + b"x\0"), [])
+        self.assertEqual(module.parse_procargs2(struct.pack("<i", -1) + b"x\0"), [])
+        # argc 大得离谱时不能把整块内存当 argv 读
+        self.assertEqual(module.parse_procargs2(struct.pack("<i", 10**9) + b"x\0"), [])
+        # 没有 NUL 分隔
+        self.assertEqual(module.parse_procargs2(struct.pack("<i", 1) + b"x"), [])
+
+    def test_recovers_apus_style_overrides_from_codex_argv(self) -> None:
+        """用 apus_codex.sh 真实那行 exec 验证还原结果。"""
+        module = self.load()
+        argv = [
+            "codex",
+            "-c",
+            "model_provider=azure-openai",
+            "-c",
+            'model_providers.azure-openai={name="Azure OpenAI",'
+            'base_url="https://coding.apuscn.com/v1",wire_api="responses",'
+            'env_key="OPENAI_API_KEY",supports_websockets=false}',
+            "-c",
+            "model=deepseek-ai/DeepSeek-V4.1-Flash",
+            "-c",
+            "model_context_window=320000",
+            "-c",
+            'model_catalog_json="/home/u/.codex/apus-models.json"',
+            "--sandbox",
+            "danger-full-access",
+            "--ask-for-approval",
+            "never",
+        ]
+        module.parent_process_argv = lambda: argv
+
+        overrides = module.resume_launch_overrides()
+        joined = " ".join(overrides)
+
+        self.assertIn("model_provider=azure-openai", joined)
+        self.assertIn('model_providers.azure-openai={name="Azure OpenAI"', joined)
+        self.assertIn("model_context_window=320000", joined)
+        self.assertIn("model_catalog_json=", joined)
+        # resume 不认 -s/--sandbox，必须换成 config 覆盖，否则沙箱静默降级。
+        self.assertIn('sandbox_mode="danger-full-access"', joined)
+        self.assertIn('approval_policy="never"', joined)
+        self.assertNotIn("--sandbox", overrides)
+
+    def test_darwin_reader_never_crashes_off_macos(self) -> None:
+        """非 macOS 上 libc 没有 sysctl 符号，取值必须被吃掉而不是崩掉。
+
+        这是实测踩过的坑：Linux 的 libc 不导出 sysctl，Python < 3.12 的
+        ctypes 抛的是 AttributeError 而不是 OSError。
+        """
+        module = self.load()
+        self.assertEqual(module.darwin_process_argv(os.getpid()), [])
+        self.assertEqual(module.darwin_process_argv(1), [])
+
+    def test_codex_argv_detection_accepts_paths(self) -> None:
+        module = self.load()
+        self.assertTrue(module.looks_like_codex_argv(["/opt/homebrew/bin/codex", "exec"]))
+        self.assertTrue(module.looks_like_codex_argv(["codex"]))
+        self.assertFalse(module.looks_like_codex_argv(["/bin/zsh", "-c", "codex"]))
+        self.assertFalse(module.looks_like_codex_argv([]))
+
+
 class PluginContractTests(unittest.TestCase):
     def test_hooks_use_the_droid_stop_shape(self) -> None:
         hooks = json.loads(HOOKS.read_text(encoding="utf-8"))
@@ -1321,6 +1717,16 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("${PLUGIN_ROOT}/scripts/auto_continue_stop.py", codex_command["command"])
         self.assertNotIn("DROID_PLUGIN_ROOT", codex_command["command"])
         self.assertGreaterEqual(codex_command["timeout"], 45)
+
+        # API 失败时 Codex 不发 Stop，只发 PostModelRequest；没有这条注册，
+        # 429 之后插件永远不会被唤醒。
+        failure_command = codex_hooks["hooks"]["PostModelRequest"][0]["hooks"][0]
+        self.assertEqual(failure_command["type"], "command")
+        self.assertIn("${PLUGIN_ROOT}/scripts/auto_continue_stop.py", failure_command["command"])
+        self.assertNotIn("DROID_PLUGIN_ROOT", failure_command["command"])
+        # 退避可能要睡满 40 秒，超时必须比它长。
+        self.assertGreater(failure_command["timeout"], 40)
+
         codex_manifest = json.loads(CODEX_MANIFEST.read_text(encoding="utf-8"))
         codex_marketplace = json.loads(CODEX_MARKETPLACE.read_text(encoding="utf-8"))
         self.assertEqual(codex_manifest["hooks"], "./hooks/codex-hooks.json")
