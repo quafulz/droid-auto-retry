@@ -4,7 +4,7 @@ Factory Droid 和 Codex 共用的插件市场。目前只有一个插件：[cust
 
 Custom Model 的回合没有真正做完就停下来时（静默中断、压缩摘要、正文截断、待办未完成），Stop hook 会自动发送「继续」。
 
-Codex 上采样请求在 API 层失败时（429、5xx、流中断），回合直接结束，Stop hook 没有机会运行。插件改听 `PostModelRequest`，确认是限流、5xx 或连接中断后，退避并用 `codex exec resume` 在同一会话里续跑，同时还原原进程命令行上的 provider、沙箱和审批设置。认证失败、配额、上下文超限和内容策略不重试。
+采样请求在 API 层失败时（429、5xx、流中断）也会续跑。Droid 这时已经进入 Stop，插件确认是可重试错误后，退避并用 `decision: block` 在当前进程里再开一轮。Codex 不发 Stop，插件改听 `PostModelRequest`，退避后用 `codex exec resume` 续跑，并还原原进程命令行上的 provider、沙箱和审批设置。认证失败、配额、上下文超限和内容策略不重试。
 
 ## 安装
 

@@ -52,6 +52,38 @@ def assistant(record_id: str, content: list[dict[str, object]] | str | None) -> 
     return {"type": "message", "id": record_id, "message": message}
 
 
+def provider_error(
+    text: str,
+    record_id: str = "err-1",
+    *,
+    visibility: str = "user_only",
+) -> dict[str, object]:
+    return {
+        "type": "message",
+        "id": record_id,
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": text}],
+            "visibility": visibility,
+        },
+    }
+
+
+def stop_hook_record(record_id: str = "hook-1") -> dict[str, object]:
+    """钩子返回之后 Droid 才把这条执行记录写进 transcript。"""
+    return {
+        "type": "message",
+        "id": record_id,
+        "message": {
+            "role": "user",
+            "content": [],
+            "visibility": "user_only",
+            "hookEventName": "Stop",
+            "hookStatus": "completed",
+        },
+    }
+
+
 def user(text: str, record_id: str = "user-1") -> dict[str, object]:
     return {
         "type": "message",
@@ -1465,6 +1497,240 @@ class FailureHookTests(unittest.TestCase):
         self.assertEqual([r.stdout for r in results[1:]], ["", ""])
 
 
+class DroidFailureStopTests(unittest.TestCase):
+    """Droid 的 429 会进入 Stop，错误已经在 transcript 里。"""
+
+    def run_stop(
+        self,
+        records: list[dict[str, object]],
+        state: Path,
+        transcript: Path,
+        **payload_updates: object,
+    ) -> subprocess.CompletedProcess[str]:
+        write_transcript(transcript, records)
+        return run_hook(
+            payload(transcript, **payload_updates),
+            state,
+            env_updates={
+                "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                "DROID_AUTO_CONTINUE_FAILURE_MAX_DELAY": "0",
+            },
+        )
+
+    def test_network_error_after_a_tool_result_continues_in_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assistant_record = assistant(
+                "tool-1",
+                [{"type": "tool_use", "name": "Execute", "input": {"command": "git log"}}],
+            )
+            assistant_record["message"]["modelId"] = "custom:Retry Model-9"
+            result = self.run_stop(
+                [
+                    user("继续改文档"),
+                    assistant_record,
+                    user("deadbeef", "tool-result"),
+                    provider_error(
+                        "错误：Your request to the LLM failed due to network issues. "
+                        "Please try again later."
+                    ),
+                    stop_hook_record(),
+                    {
+                        "type": "agent_turn_outcome",
+                        "turnId": "turn-1",
+                        "reason": "model_provider_unavailable",
+                        "resultKind": "text",
+                    },
+                ],
+                root / "state",
+                root / "session.jsonl",
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("API 层失败", output["reason"])
+        self.assertIn("不要重复已经完成", output["reason"])
+        self.assertIn("自动续跑 1/4", output["reason"])
+        self.assertEqual(
+            output["systemMessage"],
+            "Retry Model 因 API 失败中断，正在自动重试 1/4...",
+        )
+        self.assertNotIn("codex exec", result.stdout)
+
+    def test_retryable_droid_errors_continue(self) -> None:
+        cases = {
+            "429": "BYOK Error: exceeded retry limit, last status: 429 Too Many Requests",
+            "503": "BYOK Error: 503 所有供应商已熔断，无可用渠道",
+            "openai": (
+                "BYOK Error: An error occurred while processing your request. "
+                "You can retry your request, or contact us through our help center."
+            ),
+            "stream": "BYOK Error: stream_read_error\n\nUpstream error: stream_read_error",
+            "eof": "BYOK Error: JSON Parse error: Unexpected EOF",
+            "socket": "BYOK Error: 403 socket closed unexpectedly",
+            "empty": "BYOK Error: LLM response contained no usable output",
+            "both": "BYOK Error: 500 service is experiencing high traffic, please try again",
+        }
+        for name, text in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                visibility = "both" if name == "both" else "user_only"
+                result = self.run_stop(
+                    [provider_error(text, visibility=visibility)],
+                    root / "state",
+                    root / "session.jsonl",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = json.loads(result.stdout)
+                self.assertEqual(output["decision"], "block")
+                self.assertIn("正在自动重试 1/4", output["systemMessage"])
+
+    def test_terminal_and_non_turn_errors_do_not_continue(self) -> None:
+        cases = {
+            "401": provider_error("BYOK Error: 401 Unauthorized"),
+            "quota": provider_error("BYOK Error: Your quota has been exceeded"),
+            "context": provider_error(
+                "BYOK Error: This model's maximum context length is 128000 tokens"
+            ),
+            "model": provider_error(
+                'BYOK Error: 503 {"error":{"code":"model_not_found",'
+                '"message":"No available channel for model claude"}}'
+            ),
+            "400": provider_error("BYOK Error: 400 status code (no body)"),
+            "403": provider_error("BYOK Error: 403 status code (no body)"),
+            "param": provider_error(
+                "BYOK Error: 400 The parameter max_tokens is not valid: BadRequest"
+            ),
+            "background": provider_error(
+                "Background task error.\nreason: model_provider_unavailable\n"
+                "The model provider was temporarily unavailable.",
+                visibility="llm_only",
+            ),
+            "cancel": provider_error("Request interrupted by user", visibility="llm_only"),
+            "user-typed": user("日志里有 429 Too Many Requests，帮我看看"),
+        }
+        for name, record in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_stop([record], root / "state", root / "session.jsonl")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_same_record_is_not_retried_twice_but_a_new_one_is(self) -> None:
+        text = (
+            "错误：Your request to the LLM failed due to network issues. "
+            "Please try again later."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self.run_stop(
+                [provider_error(text, "err-a")],
+                root / "state",
+                root / "a.jsonl",
+            )
+            duplicate = self.run_stop(
+                [provider_error(text, "err-a")],
+                root / "state",
+                root / "a.jsonl",
+                session_id="session-1",
+            )
+            second = self.run_stop(
+                [provider_error(text, "err-b")],
+                root / "state",
+                root / "b.jsonl",
+            )
+
+        self.assertIn("正在自动重试 1/4", first.stdout)
+        self.assertEqual(duplicate.stdout, "")
+        self.assertIn("正在自动重试 2/4", second.stdout)
+
+    def test_attempt_cap_stops_the_streak(self) -> None:
+        text = "BYOK Error: 429 Too Many Requests"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = [
+                self.run_stop(
+                    [provider_error(text, f"err-{index}")],
+                    root / "state",
+                    root / f"{index}.jsonl",
+                )
+                for index in range(5)
+            ]
+
+        self.assertEqual(
+            [json.loads(result.stdout)["systemMessage"].endswith(f"{index + 1}/4...")
+             for index, result in enumerate(results[:4])],
+            [True, True, True, True],
+        )
+        self.assertEqual(results[4].stdout, "")
+
+    def test_zero_max_attempts_disables_the_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [provider_error("BYOK Error: 429 Too Many Requests")],
+            )
+            result = run_hook(
+                payload(transcript),
+                root / "state",
+                env_updates={
+                    "DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS": "0",
+                    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_unfinished_detector_flag_does_not_disable_api_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [provider_error("BYOK Error: 429 Too Many Requests")],
+            )
+            result = run_hook(
+                payload(transcript),
+                root / "state",
+                env_updates={
+                    "DROID_AUTO_CONTINUE_DETECT_UNFINISHED": "0",
+                    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                    "DROID_AUTO_CONTINUE_FAILURE_MAX_DELAY": "0",
+                },
+            )
+
+        self.assertIn("因 API 失败中断", result.stdout)
+
+    def test_a_later_answer_is_not_treated_as_an_api_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            answered = self.run_stop(
+                [
+                    provider_error("BYOK Error: 429 Too Many Requests", "old-err"),
+                    assistant("done", [{"type": "text", "text": "表已经填好。"}]),
+                ],
+                root / "state",
+                root / "answered.jsonl",
+            )
+            silent = self.run_stop(
+                [
+                    provider_error("BYOK Error: 429 Too Many Requests", "old-err"),
+                    assistant("drop", [{"type": "thinking", "thinking": "流在这里断了"}]),
+                ],
+                root / "state-b",
+                root / "silent.jsonl",
+            )
+
+        self.assertEqual(answered.stdout.strip(), "本轮任务正常完成。")
+        silent_output = json.loads(silent.stdout)
+        self.assertIn("发生中断，正在自动重试 1/4", silent_output["systemMessage"])
+        self.assertNotIn("API 失败", silent_output["systemMessage"])
+
+
 class ResumeHelperTests(unittest.TestCase):
     """后台辅助进程：先退避、等写锁释放，再续跑。"""
 
@@ -1702,7 +1968,8 @@ class PluginContractTests(unittest.TestCase):
         self.assertNotIn("hooks", hooks)
         self.assertEqual(command["type"], "command")
         self.assertIn("${DROID_PLUGIN_ROOT}/scripts/auto_continue_stop.py", command["command"])
-        self.assertGreaterEqual(command["timeout"], 45)
+        # API 失败的退避睡在这条 Stop 命令里，最长 40 秒。
+        self.assertGreater(command["timeout"], 40)
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "custom-model-stop-patch")

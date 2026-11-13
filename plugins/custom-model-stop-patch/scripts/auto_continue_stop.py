@@ -4,10 +4,16 @@
 Droid 读自己的 transcript。Codex 读 rollout 里的 response_item。
 两边的续跑结论一致：静默中断、压缩摘要、截断、协议泄漏、未完成待办会续跑。
 
-Codex 还有一个 Stop 钩子接不到的出口：采样请求在 API 层失败（429 限流、5xx、
-流中断）时，Codex 直接结束回合，不触发 Stop。插件为此额外注册了
-PostModelRequest —— 它在失败时带 status=failed，是 Codex 唯一能报告这类失败的
-可观测钩子。拿到失败后按指数退避等待，再拉一次 `codex exec resume`。
+采样请求在 API 层失败（429、5xx、流中断）时，两边的出口不同。
+
+Droid 仍会进入 Stop，transcript 里已经有一条只给用户看的错误。确认可重试后，
+在当前进程里退避，再用 decision:block 开一轮。模型、自主级别和权限都还在，
+所以不另起 `droid exec`。
+
+Codex 不发 Stop。插件听 PostModelRequest（失败时带 status=failed，输出不参与
+控制流），退避后拉一次 `codex exec resume`。
+
+认证失败、配额、上下文超限和内容策略两边都不重试。
 """
 
 from __future__ import annotations
@@ -88,6 +94,16 @@ RETRYABLE_FAILURE_HINTS = (
     "timed out",
     "timeout",
     "temporarily unavailable",
+    # Droid 经常不带 HTTP 状态码，只留这几句原文。
+    "network issue",
+    "try again later",
+    "you can retry",
+    "stream_read_error",
+    "unexpected eof",
+    "socket closed",
+    "no usable output",
+    "已熔断",
+    "无可用渠道",
 )
 # 明确不该重试的失败：重试只会重复失败，还会白等。
 TERMINAL_FAILURE_HINTS = (
@@ -141,6 +157,7 @@ ENDING_SUMMARY = "summary"
 ENDING_TRUNCATED = "truncated"
 ENDING_LEAK = "leak"
 ENDING_TODOS = "todos"
+ENDING_API = "api"
 ENDING_TOOL_USE = "tool_use"
 ENDING_UNKNOWN = "unknown"
 ENDING_COMPLETE = "complete"
@@ -160,6 +177,9 @@ CONTINUATION_REASONS = {
         "回合在输出途中结束。"
     ),
     ENDING_TODOS: "继续。上一条消息结束时待办列表仍有未完成项。",
+    ENDING_API: (
+        "继续。上一轮在 API 层失败（限流、服务端错误或连接中断），没有输出正文。"
+    ),
 }
 CONTINUATION_TAIL = (
     "从中断处继续当前任务。先核对已经成功的修改和命令结果，"
@@ -809,6 +829,51 @@ def claim_attempt(
         connection.close()
 
 
+def finish_provider_failure(
+    *,
+    session_id: str,
+    message: str,
+    fingerprint: str,
+    model_name: str,
+) -> int:
+    """Droid 的 API 失败已经停在 Stop 上，直接 block 即可，不用另起进程。"""
+    max_attempts = env_int(
+        "DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS",
+        DEFAULT_FAILURE_MAX_ATTEMPTS,
+        minimum=0,
+        maximum=MAX_MAX_ATTEMPTS,
+    )
+    if max_attempts <= 0:
+        return 0
+    attempt = claim_failure_attempt(
+        session_id,
+        message,
+        max_attempts=max_attempts,
+        fingerprint=fingerprint,
+    )
+    if attempt is None:
+        return 0
+    delay = failure_delay_seconds(attempt)
+    if delay > 0:
+        time.sleep(delay)
+    print(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": build_reason(ENDING_API, "", attempt, max_attempts),
+                "systemMessage": build_system_message(
+                    model_name,
+                    attempt,
+                    max_attempts,
+                    ENDING_API,
+                ),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def run_failure_hook(payload: dict[str, Any]) -> int:
     """PostModelRequest 是观测钩子，Codex 只记日志、不解读输出。
 
@@ -951,6 +1016,8 @@ def model_display_name(message: dict[str, Any], cwd: str | None) -> str:
 def build_system_message(model_name: str, attempt: int, max_attempts: int, kind: str) -> str:
     if kind == ENDING_SILENT:
         return f"{model_name} 发生中断，正在自动重试 {attempt}/{max_attempts}..."
+    if kind == ENDING_API:
+        return f"{model_name} 因 API 失败中断，正在自动重试 {attempt}/{max_attempts}..."
     return f"{model_name} 任务尚未完成，正在自动续跑 {attempt}/{max_attempts}..."
 
 
@@ -1188,6 +1255,96 @@ def failure_is_retryable(message: str) -> bool:
     if any(hint in text for hint in RETRYABLE_FAILURE_HINTS):
         return True
     return bool(RETRYABLE_HTTP_STATUS.search(text))
+
+
+PROVIDER_ERROR_PREFIXES = (
+    "byok error:",
+    "错误：",
+    "错误:",
+    "upstream error:",
+)
+# 有些 Droid 报错不带 BYOK 前缀，只剩这几个固定说法。
+PROVIDER_ERROR_MARKERS = (
+    "byok error:",
+    "your request to the llm failed",
+    "upstream error:",
+    "stream_read_error",
+    "socket closed",
+    "no usable output",
+)
+
+
+def looks_like_provider_error(text: str) -> bool:
+    """把供应商报错和用户自己贴进来的「429」区分开。"""
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith(PROVIDER_ERROR_PREFIXES):
+        return True
+    return any(marker in lowered for marker in PROVIDER_ERROR_MARKERS)
+
+
+def is_hook_execution_record(record: dict[str, Any]) -> bool:
+    """Stop 的执行记录在钩子返回后才写入，回放时会排在错误后面。"""
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return False
+    return isinstance(message.get("hookEventName"), str)
+
+
+def message_plain_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if isinstance(block, dict) and block.get("type") in TEXT_BLOCK_TYPES:
+            parts.append(block_text(block))
+    return "".join(parts)
+
+
+def trailing_provider_failure(records: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """最新一条真实消息是可重试的供应商错误时，返回 (正文, 记录 id)。
+
+    只认紧挨着回合结尾的那一条。llm_only 的后台任务错误不是这一轮的结尾，
+    遇到就停，不往前翻，避免把半小时前的 429 再续一次。
+    """
+    for record in reversed(records):
+        if record.get("type") != "message":
+            continue
+        if is_hook_execution_record(record):
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return None
+        if message.get("visibility") not in {"user_only", "both"}:
+            return None
+        text = message_plain_text(message).strip()
+        if not looks_like_provider_error(text) or not failure_is_retryable(text):
+            return None
+        record_id = record.get("id")
+        if not isinstance(record_id, str) or not record_id.strip():
+            record_id = digest(text)
+        else:
+            record_id = record_id.strip()
+        return text, record_id
+    return None
+
+
+def latest_assistant_model_name(records: list[dict[str, Any]], cwd: str | None) -> str:
+    for record in reversed(records):
+        if record.get("type") != "message" or is_hook_execution_record(record):
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        return model_display_name(message, cwd)
+    return UNKNOWN_MODEL_NAME
 
 
 def failure_delay_seconds(attempt: int) -> float:
@@ -1584,11 +1741,14 @@ def claim_failure_attempt(
     message: str,
     *,
     max_attempts: int,
+    fingerprint: str | None = None,
 ) -> int | None:
     """失败续跑的计数，按「会话 + 失败指纹」累积。
 
     同一轮失败可能被多次报告（重复投递、并发子代理），用指纹去重，避免
-    同一处失败反复退避、把次数和等待都烧光。
+    同一处失败反复退避、把次数和等待都烧光。Codex 的指纹是错误原文。
+    Droid 传入 transcript 记录 id：同一句 network issues 会在下一轮
+    再出现一次，那是新的失败，不能被原文去重吞掉。
     """
     ttl_seconds = env_int(
         "DROID_AUTO_CONTINUE_STATE_TTL_SECONDS",
@@ -1609,7 +1769,10 @@ def claim_failure_attempt(
             "SELECT attempts, assistant_hash, last_seen FROM streaks WHERE scope_hash = ?",
             (scope_hash,),
         ).fetchone()
-        fingerprint = digest(" ".join(message.split())[:2000])
+        if fingerprint is None:
+            fingerprint = digest(" ".join(message.split())[:2000])
+        else:
+            fingerprint = digest(fingerprint.strip())
         if row is None:
             attempts = 0
         else:
@@ -1775,6 +1938,16 @@ def main() -> int:
             model_name=codex_model_name(payload),
             announce_complete=False,
             todo_tool="update_plan",
+        )
+
+    provider_failure = trailing_provider_failure(records)
+    if provider_failure is not None:
+        error_text, record_id = provider_failure
+        return finish_provider_failure(
+            session_id=session_id,
+            message=error_text,
+            fingerprint=record_id,
+            model_name=latest_assistant_model_name(records, cwd),
         )
 
     record = last_assistant_record(records)

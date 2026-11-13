@@ -18,6 +18,7 @@ Factory Droid 和 Codex 插件。Custom Model 的回合没有真正做完就停�
 - 已经发出工具调用：不续跑，交给 Droid 执行工具。
 - 出现无法识别的内容块：不续跑。
 - transcript 还没写出这条消息、路径不可读，或 Stop payload 缺字段：不续跑。
+- 采样请求因限流、5xx 或连接中断失败，回合停在一条只展示给用户的供应商错误上：续跑。系统消息形如 `Hook message: Custom Model 因 API 失败中断，正在自动重试 1/4...`。`Hook message:` 是 Droid 加的前缀。认证失败、配额、上下文超限、内容策略、模型不存在和请求参数错误不续跑。
 
 同一轮里连续自动续跑默认最多 4 次。判定「连续」依据 transcript 里的最后一次工具调用：再次 Stop 时如果已经出现了新的工具调用，说明模型在两次中断之间真的干了活，连续次数从 1 重新开始计；全新的用户消息（`stop_hook_active` 为 false）同样从 1 开始。只看 `stop_hook_active` 不够：实测 Droid 在整个续跑链里始终把它置为 true，跑完 104 次工具调用之后的一次中断仍会被算成连续第 3 次，次数很快用完，之后真正的压缩摘要中断就不再续跑。所以插件自己比对 transcript 里的工具调用 id。次数用完后停住，你可以再手工输入「继续」，那一次会重新开始计数。主界面不显示 thinking，所以静默中断看起来像是工具输出之后直接停住。
 
@@ -30,6 +31,18 @@ Factory Droid 和 Codex 插件。Custom Model 的回合没有真正做完就停�
 - 子代理的 SubagentStop。插件只注册主会话的 Stop。
 
 自动续跑不是事务。续跑提示要求先核对已经成功的修改和命令，再决定要不要重做。
+
+## Droid 上的 API 失败
+
+Droid 在供应商请求失败时仍然进入 Stop。失败文字先写入 transcript，`agent_turn_outcome` 要等钩子返回之后才追加，所以插件不读 outcome。它只看最新一条真实消息，并跳过钩子自己的执行记录：
+
+- 必须是 `visibility` 为 `user_only` 或 `both` 的用户消息，正文像 `BYOK Error:`、`错误：` 这类供应商报错。
+- `llm_only` 的后台任务错误不是这一轮的结尾，不续跑。你自己发的消息也不是。
+- 可重试的范围和 Codex 相同：429、500、502、503、504，以及网络中断、流被掐断、套接字意外关闭。Droid 的原文经常不带状态码，例如 `Your request to the LLM failed due to network issues`、`stream_read_error`、`Unexpected EOF`、`socket closed unexpectedly`、`no usable output`，这些也算。
+- 续跑用 `decision: "block"`，不另起 `droid exec`。当前进程还握着模型、自主级别和权限，再拉一个进程只会和它抢会话。
+- 退避睡在 Stop hook 里：默认 5 秒起，每次乘 2，封顶 40 秒。`hooks.json` 的超时是 70 秒，给这次等待留出余量。次数和 Codex 共用 `DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS`，按会话累计。同一条 transcript 记录重复上报不记第二次；同一句错误换了一条新记录，算下一次。
+
+这不是重放刚才那次 HTTP 请求。模型会看到一条对账说明，先核对已经成功的修改，再从中断处继续。
 
 ## Codex
 
@@ -44,6 +57,8 @@ Codex 的 transcript 是 rollout。一次采样里的思考是单独的 `reasoni
 - 子线程的 SubagentStop、用户取消时的 Interrupt 都不注册。
 
 ### API 失败（429、5xx、流中断）
+
+Droid 走上面的 Stop 路径。下面只讲 Codex。
 
 这是 Codex 侧最容易漏掉的一类中断：**采样请求在 API 层失败时，Codex 不发 Stop，也不发任何其它回合结束事件**。`core/src/session/turn.rs` 里的重试循环在错误分支直接结束回合，`run_turn_stop_hooks` 只挂在正常收尾的路径上。钩子消费方会看到「用户提交了提示词，然后什么都没有」，误以为会话还在忙。
 
@@ -120,7 +135,7 @@ Droid 更新已经装好的插件不用重开会话。Droid 每一轮都会重�
 | `DROID_AUTO_CONTINUE_STATE_TTL_SECONDS` | `7200` | 连续次数的过期时间 |
 | `DROID_AUTO_CONTINUE_STATE_DIR` | 空 | 状态目录。默认是 `${XDG_STATE_HOME:-~/.local/state}/custom-model-stop-patch` |
 | `DROID_AUTO_CONTINUE_TRANSCRIPT_TAIL_BYTES` | `524288` | 只读 transcript 尾部 |
-| `DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS` | `4` | `0-10`。API 失败后续跑的次数，`0` 关闭 |
+| `DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS` | `4` | `0-10`。Droid 和 Codex 的 API 失败共用这个次数，`0` 关闭 |
 | `DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY` | `5` | API 失败后的第一次等待秒数 |
 | `DROID_AUTO_CONTINUE_FAILURE_MAX_DELAY` | `40` | API 失败后的单次等待上限，硬上限 40 秒 |
 
