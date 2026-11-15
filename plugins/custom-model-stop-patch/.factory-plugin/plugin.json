@@ -1,6 +1,6 @@
 {
   "name": "custom-model-stop-patch",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "回合没有真正做完，或采样请求因限流、5xx、连接中断失败时，自动从中断处继续。",
   "author": {
     "name": "quafulz",

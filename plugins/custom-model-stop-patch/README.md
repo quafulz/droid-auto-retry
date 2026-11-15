@@ -20,7 +20,7 @@ Factory Droid 和 Codex 插件。Custom Model 的回合没有真正做完就停�
 - transcript 还没写出这条消息、路径不可读，或 Stop payload 缺字段：不续跑。
 - 采样请求因限流、5xx 或连接中断失败，回合停在一条只展示给用户的供应商错误上：续跑。系统消息形如 `Hook message: Custom Model 因 API 失败中断，正在自动重试 1/4...`。`Hook message:` 是 Droid 加的前缀。认证失败、配额、上下文超限、内容策略、模型不存在和请求参数错误不续跑。
 
-同一轮里连续自动续跑默认最多 4 次。判定「连续」依据 transcript 里的最后一次工具调用：再次 Stop 时如果已经出现了新的工具调用，说明模型在两次中断之间真的干了活，连续次数从 1 重新开始计；全新的用户消息（`stop_hook_active` 为 false）同样从 1 开始。只看 `stop_hook_active` 不够：实测 Droid 在整个续跑链里始终把它置为 true，跑完 104 次工具调用之后的一次中断仍会被算成连续第 3 次，次数很快用完，之后真正的压缩摘要中断就不再续跑。所以插件自己比对 transcript 里的工具调用 id。次数用完后停住，你可以再手工输入「继续」，那一次会重新开始计数。主界面不显示 thinking，所以静默中断看起来像是工具输出之后直接停住。
+同一轮里连续自动续跑默认最多 4 次。判定「连续」依据 transcript 里的最后一次工具调用：再次 Stop 时如果已经出现了新的工具调用，说明模型在两次中断之间真的干了活，连续次数从 1 重新开始计；全新的用户消息（`stop_hook_active` 为 false）同样从 1 开始。只看 `stop_hook_active` 不够：实测 Droid 在整个续跑链里始终把它置为 true，跑完 104 次工具调用之后的一次中断仍会被算成连续第 3 次，次数很快用完，之后真正的压缩摘要中断就不再续跑。所以插件自己比对 transcript 里的工具调用 id。次数用完后停住；下一条新的用户消息会重新开始计数。主界面不显示 thinking，所以静默中断看起来像是工具输出之后直接停住。
 
 提问判断是文本启发式，不是语义理解。待办判断不看 assistant 正文，也不解析模型写的自由文本：它只比较「Droid 是否真的解析了每一行」这个结构事实，再读 `todo_state` 里已经成型的状态。模型如果一边说「接下来我会继续」一边结束回合，插件不会续跑；反过来，模型如果忘了把待办标成完成，可能被多续跑一次——续跑提示会先要它对账，属于这种情况时一般一轮就收住。上限 4 次保底。
 
@@ -62,11 +62,23 @@ Droid 走上面的 Stop 路径。下面只讲 Codex。
 
 这是 Codex 侧最容易漏掉的一类中断：**采样请求在 API 层失败时，Codex 不发 Stop，也不发任何其它回合结束事件**。`core/src/session/turn.rs` 里的重试循环在错误分支直接结束回合，`run_turn_stop_hooks` 只挂在正常收尾的路径上。钩子消费方会看到「用户提交了提示词，然后什么都没有」，误以为会话还在忙。
 
-Codex 唯一能观测到这类失败的是 `PostModelRequest`：它是观察型钩子，失败时带 `status: "failed"` 和 `error` 文本，输出只被写进日志、不参与控制流。插件注册了它，拿到失败后：
+Codex 唯一能观测到这类失败的是 `PostModelRequest`：它是观察型钩子，失败时带 `status: "failed"` 和 `error` 文本，插件注册了它。hook 输出的 `systemMessage` 只用于在 TUI 上显示提示，不能证明后台辅助进程已经投递消息，也不能证明会话已经恢复；恢复结论只由 rollout 的新 `task_started` 决定。
 
-1. 判断这个失败是否值得重试。只认限流、5xx、连接中断；认证失败、上下文超限、配额、内容策略这些终态错误一律不碰——重试只会重复失败还白等。
-2. 按指数退避等待：默认 5 秒起，每次乘 2，封顶 40 秒。等待不占 Codex 自己的重试预算。
-3. 拉起 `codex exec resume <session_id>`，把一条对账指令作为新一轮输入送进同一会话。
+拿到可重试失败后，插件按指数退避（默认 5 秒起，每次乘 2，封顶 40 秒），再拉起一个脱离 hook 的后台辅助进程。辅助进程采用 queue-first，只有 queue 明确不可用时才回退到 exec resume。同一 session 和 `turn_id` 的多个不同错误共享一个恢复 job，不会因为 429 之后又报流中断而重复投递；进入新的 turn 后才会再次尝试。没有 `turn_id` 时仍按错误指纹去重：
+
+1. **queue-first**：执行
+   ```bash
+   codex queue --thread <session_id> --message <续跑提示> --resume
+   ```
+   把一条对账提示持久投递到原 thread。queue 使用原 thread 的 model、provider、cwd 和权限，不抢 `thread-writer-locks/<session>.lock`，也不需要 `resume_launch_overrides()`。TUI 长期持有写锁时，queue 仍可把消息写进共享 app-server 队列，由已加载的线程在 idle 后启动。
+
+2. **验证新 turn**：命令返回 0 只表示消息已经持久入队，不能直接记为恢复。辅助进程读原 rollout，只有看到与失败 turn 不同的 `turn_id` 的新 `task_started`，才把 job 记为 `recovered`。`DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS`（默认 10 秒）只是辅助进程退出前的短观察窗口；没有看到新 turn 时，job 保持 `queued`，`verify_until` 按 `DROID_AUTO_CONTINUE_QUEUE_VERIFY_SECONDS`（默认 900 秒）设置待核对期限。后续任意 Stop 或 `PostModelRequest` hook 会按持久化的 transcript 路径、偏移和失败 `turn_id` 继续读取 rollout，看到新 turn 后转为 `recovered`。`DROID_AUTO_CONTINUE_QUEUE_TIMEOUT_SECONDS`（默认 60 秒）内 queue 命令没有结束，或其它非零结果的含义不明确时，也保留 `queued` 待核对，不自动 fallback，也不重复投递。
+
+3. **exec fallback**：只有 queue 明确不受支持（例如未知子命令、`thread/queue/add` 不存在或 `method not found`）时，辅助进程才等待写锁释放，然后执行 `codex exec resume <session_id> <续跑提示>`。exec 若报 `already has an active writer` 且 rollout 还没有新 turn，会再补一次 queue。等待写锁超过 `DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS`（默认 180 秒）时，job 落成 `blocked_active_writer`，`detail` 和事件日志保留原因，不会静默退出。
+
+`codex queue` 依赖 Codex 0.169+ 的 CLI 和底层的 `thread/queue/add`。命令返回 0 只证明消息已持久入队；超时和非零只说明结果未知，服务端可能已经入队，因此不能据此再发一次 exec。只有明确的“不支持 queue”错误才允许 fallback。恢复结论仍只来自 rollout 的新 `task_started`。codex 可执行文件或辅助进程无法启动时，状态记为 `failed_to_launch`，不会误报为已恢复。
+
+**为什么要从完整 JSONL 行开始观察**：job 创建时，插件把 transcript 路径、失败 `turn_id` 和当前完整 JSONL 行的末尾写入 `resume_jobs`。直接保存文件大小可能落在半行中间；下一次从那里读取会丢掉这行的开头，若它恰好是新 turn 的 `task_started`，就会漏报恢复。后台观察和后续 hook 对账都保留末尾不完整行，下一轮从同一偏移重读，等整行写完后重新解析。
 
 **为什么不直接重新发请求**：Codex 没有这个入口。`turn/start` 虽然接受空 `input`，但没有 CLI 或 app-server 方法让外部进程触发「零消息重采样」；`ContinueIfIdle` 那种空唤醒只在内部恢复路径（`daemon_continuation.rs`）使用。所以续跑必然要带一条消息。指令写成对账式，先核对已完成的修改再继续，避免重做有副作用的操作。
 
@@ -76,9 +88,9 @@ Codex 唯一能观测到这类失败的是 `PostModelRequest`：它是观察型�
 
 其一，hook 有自己的超时，睡在 hook 里会挤占 Codex 的收尾时间。
 
-其二，也是更关键的：插件在 `PostModelRequest` 里运行时，发起回合的 Codex 进程**仍然持有该会话的写锁**（实测 `PostModelRequest` 执行期间 `thread-writer-locks/<session>.lock` 是 HELD，进程退出才释放）。此时直接 `codex exec resume` 必定报 `already has an active writer`。后台进程轮询共享锁等到释放那一瞬间再续跑，默认最多等 180 秒。
+其二，也是更关键的：插件在 `PostModelRequest` 里运行时，发起回合的 Codex 进程**仍然持有该会话的写锁**（实测 `PostModelRequest` 执行期间 `thread-writer-locks/<session>.lock` 是 HELD，进程退出才释放）。此时直接执行 `codex exec resume` 会被拒绝。queue 路径不依赖这把锁；只有 fallback 才由后台进程轮询共享锁，默认最多等 `DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS`。
 
-**为什么要还原启动参数**：`codex exec resume` 是**新进程**，只从 `config.toml` 和自身参数取值。原进程那些只存在于命令行的设置会全部丢掉，实测有两类后果：
+**回退路径为什么要还原启动参数**：`codex exec resume` 是**新进程**，只从 `config.toml` 和自身参数取值。原进程那些只存在于命令行的设置会全部丢掉，实测有两类后果：
 
 1. 自定义 provider（很多网关的启动脚本这么写）丢失，报 `model provider is no longer configured`。
 2. **沙箱静默降级**：原进程用 `-s danger-full-access` 启动时，续跑进程会退回默认的 `read-only`，模型接着写文件、跑命令全部失败。
@@ -97,7 +109,7 @@ Codex 唯一能观测到这类失败的是 `PostModelRequest`：它是观察型�
 
 macOS 这一档**不能**用 `ps -o args=`。它把 argv 用空格拼成一行，参数内部的空格无法还原。`apus_codex.sh` 传的就是 `-c 'model_providers.azure-openai={name="Azure OpenAI",...}'`，按空格切会得到 `name="Azure` 和 `OpenAI",...}` 两段，续跑进程拿到一个坏掉的 provider 定义。`KERN_PROCARGS2` 返回的是原始字节，能精确还原每一个参数。
 
-**已知限制**：TUI 场景下发起回合的 TUI 会一直活着（默认空闲 60 秒才释放写锁，`thread_unload_delay_secs`），等待窗口内能不能抢到取决于 TUI 何时让出。等不到就放手，不给用户留下一个挂着的后台进程——这种情况需要手工输入「继续」。`codex exec` 这类一次性进程退出很快，基本都能等到。Windows 上因为读不到命令行，只有把 provider 写在 `config.toml` 里才能续跑成功。
+**已知限制**：queue 成功不等于恢复。如果原 TUI/app-server 已经不存在、线程没有 runtime 消费队列，或者消息没有在待核对期限内启动新 turn，最终状态仍不是 `recovered`。超过 `DROID_AUTO_CONTINUE_QUEUE_VERIFY_SECONDS` 仍未见新 turn 的待核对 job、fallback 等写锁超时留下的 `blocked_active_writer`，以及 exec 正常退出但没有确认新 turn 的 `completed_unverified`，都不能当成已恢复。应结合 rollout 的 `task_started`、`resume_jobs.state` / `detail` 和 `${DROID_AUTO_CONTINUE_STATE_DIR}/logs/<job_id>.jsonl` 判断。日志目录不可写时，辅助进程仍会启动，只是降级为没有事件日志。Windows 上因为读不到命令行，只有把 provider 写在 `config.toml` 里才能让 exec fallback 续跑成功；queue 路径仍沿用原 thread 配置。
 
 ## 安装
 
@@ -138,10 +150,35 @@ Droid 更新已经装好的插件不用重开会话。Droid 每一轮都会重�
 | `DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS` | `4` | `0-10`。Droid 和 Codex 的 API 失败共用这个次数，`0` 关闭 |
 | `DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY` | `5` | API 失败后的第一次等待秒数 |
 | `DROID_AUTO_CONTINUE_FAILURE_MAX_DELAY` | `40` | API 失败后的单次等待上限，硬上限 40 秒 |
+| `DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS` | `180` | `0-3600`。exec fallback 等待 thread writer lock 的上限；超时状态为 `blocked_active_writer`，`0` 表示立即判定 |
+| `DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS` | `1` | `0.05-10`。等待写锁的轮询间隔（秒） |
+| `DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS` | `10` | `0.05-120`。辅助进程退出前观察 rollout 出现新 turn 的短窗口（秒）；未见新 turn 时 job 保持 `queued` 待后续对账 |
+| `DROID_AUTO_CONTINUE_QUEUE_VERIFY_SECONDS` | `900` | `0.05-86400`。`queued` job 的待核对期限（秒），写入 `verify_until`；后续 hook 可在此期限内观察新 turn |
+| `DROID_AUTO_CONTINUE_QUEUE_TIMEOUT_SECONDS` | `60` | `1-300`。`codex queue` 命令超时（秒）；超时视为结果未知，不重复投递 |
+| `DROID_AUTO_CONTINUE_RESUME_TIMEOUT_SECONDS` | `3600` | `1-86400`。exec fallback 的最大运行时间（秒）；也用于回收遗留未完成 job |
 
 `DROID_AUTO_CONTINUE_BACKOFF_FACTOR` 同时用于这两条退避路径。
 
-状态库只保存 session 和消息 id 的 SHA-256、次数、时间戳和最后一次工具调用的 id。
+`DROID_AUTO_CONTINUE_STATE_DIR` 默认是 `${XDG_STATE_HOME:-~/.local/state}/custom-model-stop-patch`。状态库是其中的 `streaks.sqlite3`：`streaks` 记录连续中断和 API 失败次数；`resume_jobs` 记录每次恢复尝试的 session/turn/error 哈希、transcript 路径和完整 JSONL 行偏移、失败 `turn_id`、基线时间、`verify_until`、统一状态、派发/API 尝试次数、helper PID、退出码、是否看到新 turn、`detail` 和时间戳。同 session 和 turn 的 job 以 turn 标识去重，不同错误只更新同一个 job 的诊断信息。每次 job 的事件写入 `logs/<job_id>.jsonl`，其中命令和输出尾部会做敏感信息清理；日志目录不可写不会阻止辅助进程启动，只会失去这份事件日志。
+
+从 0.5.0 升级到 0.5.1 时，第一次打开状态库会在同一个事务里重建旧的 `resume_jobs` 表，补上包含 `queued` 的 CHECK；已有 job、后加列和 `resume_jobs_scope_created` 索引都会保留。迁移失败则整次回滚，不会留下删掉旧表的新库。
+
+`resume_jobs.state` 使用以下状态：
+
+| 状态 | 含义 |
+| --- | --- |
+| `scheduled` | hook 已建立恢复 job 并拉起辅助进程，等待后续 queue 或 fallback |
+| `queued` | queue 命令已启动、返回成功或结果未知；消息可能已持久入队，但不代表新 turn 已开始。短窗口未见新 turn 时保持此状态，后续 hook 继续核对直到 `verify_until`；期限到后仍未确认则转为 `completed_unverified` |
+| `waiting_lock` | 辅助进程已启动并准备 queue，或 queue 明确不受支持后等待 exec fallback 所需的 thread writer lock |
+| `dispatching` | exec fallback 已启动 |
+| `recovered` | rollout 出现与失败 turn 不同 `turn_id` 的 `task_started` |
+| `completed_unverified` | exec fallback 正常退出却没有新 turn，或 `queued` 的待核对期限到期仍没有新 turn；这不是 queue settle 的恢复结论 |
+| `blocked_active_writer` | exec fallback 等写锁超时 |
+| `failed` | exec 返回非零、超时，或辅助进程以其它方式失败 |
+| `failed_to_launch` | codex、辅助进程或派发进程无法启动，恢复未真正发出 |
+| `superseded` | queue、等锁或派发前发现已有新 turn，当前 job 不再需要动作 |
+
+诊断时先看 `resume_jobs.state`、`detail` 和 `verify_until`，再用 `job_id` 打开对应日志。`queued` 表示消息可能已入队但新 turn 尚未得到确认；`blocked_active_writer` 表示 fallback 没等到写锁；`completed_unverified` 表示 exec 正常退出或 `queued` 待核对期限到期，但仍没有确认新 turn。这些状态都不能当成成功，恢复只以 rollout 中不同 `turn_id` 的 `task_started` 为准。日志里可关注 `queue_*`、`lock_wait_*`、`dispatch_*`、`superseded*` 事件；日志目录不可写时没有这份事件记录。
 
 ## 复核待办判据（开发用）
 

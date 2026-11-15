@@ -11,7 +11,10 @@ Droid 仍会进入 Stop，transcript 里已经有一条只给用户看的错误�
 所以不另起 `droid exec`。
 
 Codex 不发 Stop。插件听 PostModelRequest（失败时带 status=failed，输出不参与
-控制流），退避后拉一次 `codex exec resume`。
+控制流），退避后先通过 `codex queue --thread ... --resume` 把续跑提示持久交给
+原会话；只有 queue 明确不受支持时才等待写锁并回退到 `codex exec resume`。
+queue 成功也不等于已恢复，必须由 rollout 出现不同 turn_id 的新 task_started
+证明；后台 helper 退出后由后续 hook 继续对账。
 
 认证失败、配额、上下文超限和内容策略两边都不重试。
 """
@@ -23,11 +26,13 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -59,13 +64,40 @@ DEFAULT_FAILURE_BASE_DELAY_SECONDS = 5.0
 DEFAULT_FAILURE_MAX_DELAY_SECONDS = 40.0
 DEFAULT_FAILURE_MAX_ATTEMPTS = 4
 MAX_HOOK_SLEEP_SECONDS = 40.0
-# 续跑等写锁的上限。发起回合的 Codex 进程通常在失败后很快退出，
-# 但 TUI 场景下会一直活着（默认空闲 60 秒才释放），所以给足窗口，
-# 拿不到就放手，不无限挂着一个后台进程。
-LOCK_WAIT_TIMEOUT_SECONDS = 180.0
-LOCK_POLL_INTERVAL_SECONDS = 1.0
+# 续跑等写锁的上限。TUI 可能长期订阅线程，写锁不会按固定时长释放；
+# 超时必须落成 blocked_active_writer，不能悄悄退出。
+DEFAULT_LOCK_WAIT_TIMEOUT_SECONDS = 180.0
+DEFAULT_LOCK_POLL_INTERVAL_SECONDS = 1.0
+MAX_LOCK_WAIT_TIMEOUT_SECONDS = 3600.0
+MAX_LOCK_POLL_INTERVAL_SECONDS = 10.0
+DEFAULT_QUEUE_SETTLE_SECONDS = 10.0
+MAX_QUEUE_SETTLE_SECONDS = 120.0
+# queue 成功后消息已经持久化；这是辅助进程继续观察 rollout 的总窗口。
+# 原 TUI 可能在忙，10 秒内看不到新 turn 不能据此否定恢复。
+DEFAULT_QUEUE_VERIFY_SECONDS = 900.0
+MAX_QUEUE_VERIFY_SECONDS = 24 * 60 * 60.0
+DEFAULT_QUEUE_COMMAND_TIMEOUT_SECONDS = 60.0
+MAX_QUEUE_COMMAND_TIMEOUT_SECONDS = 300.0
 PROCESS_QUERY_TIMEOUT_SECONDS = 5.0
 MAX_PROCESS_ARG_COUNT = 4096
+MAX_RESUME_LOG_TAIL_BYTES = 8192
+RESUME_JOB_STATES = frozenset(
+    {
+        "scheduled",
+        "queued",
+        "waiting_lock",
+        "dispatching",
+        "recovered",
+        "completed_unverified",
+        "blocked_active_writer",
+        "failed",
+        "failed_to_launch",
+        "superseded",
+    }
+)
+RESUME_ACTIVE_STATES = frozenset(
+    {"scheduled", "queued", "waiting_lock", "dispatching"}
+)
 RESUME_PROMPT = (
     "继续。上一轮在 API 层失败并且已经重试，没有输出正文。"
     "先核对已经成功的修改和命令结果，再从中断处继续当前任务，"
@@ -248,8 +280,16 @@ def state_database() -> Path:
     return state_directory() / "streaks.sqlite3"
 
 
+def resume_log_directory() -> Path:
+    return state_directory() / "logs"
+
+
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def read_payload() -> dict[str, Any] | None:
@@ -716,28 +756,139 @@ def delay_seconds(attempt: int) -> float:
     return min(cap, MAX_SLEEP_SECONDS, delay)
 
 
+RESUME_JOB_COLUMNS = (
+    "job_id",
+    "scope_hash",
+    "session_hash",
+    "turn_hash",
+    "error_hash",
+    "transcript_offset",
+    "baseline_at",
+    "transcript_path",
+    "turn_id",
+    "verify_until",
+    "state",
+    "dispatch_attempts",
+    "api_attempts",
+    "resume_pid",
+    "exit_code",
+    "new_turn_seen",
+    "detail",
+    "created_at",
+    "updated_at",
+)
+
+
+def resume_jobs_table_sql(
+    table_name: str = "resume_jobs", *, if_not_exists: bool = False
+) -> str:
+    states = ", ".join(repr(state) for state in sorted(RESUME_JOB_STATES))
+    prefix = "CREATE TABLE IF NOT EXISTS" if if_not_exists else "CREATE TABLE"
+    return f"""
+        {prefix} {table_name} (
+            job_id TEXT PRIMARY KEY,
+            scope_hash TEXT NOT NULL,
+            session_hash TEXT NOT NULL,
+            turn_hash TEXT NOT NULL,
+            error_hash TEXT NOT NULL,
+            transcript_offset INTEGER NOT NULL DEFAULT 0 CHECK(transcript_offset >= 0),
+            baseline_at INTEGER NOT NULL DEFAULT 0 CHECK(baseline_at >= 0),
+            transcript_path TEXT,
+            turn_id TEXT,
+            verify_until INTEGER NOT NULL DEFAULT 0 CHECK(verify_until >= 0),
+            state TEXT NOT NULL CHECK(state IN ({states})),
+            dispatch_attempts INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_attempts >= 0),
+            api_attempts INTEGER NOT NULL DEFAULT 0 CHECK(api_attempts >= 0),
+            resume_pid INTEGER,
+            exit_code INTEGER,
+            new_turn_seen INTEGER CHECK(new_turn_seen IN (0, 1)),
+            detail TEXT,
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+        )
+    """
+
+
+def migrate_resume_jobs_state_constraint(connection: sqlite3.Connection) -> None:
+    """Rebuild an older resume_jobs table whose CHECK lacks a current state.
+
+    ``CREATE TABLE IF NOT EXISTS`` does not update a CHECK constraint. 0.5.0's
+    table already had most resume-job columns, so the column-by-column migration
+    left its old state list intact; writing ``queued`` then failed every time.
+    Rebuild only when a supported state is missing, preserving every row.
+    """
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resume_jobs'"
+    ).fetchone()
+    existing_sql = row[0] if row and isinstance(row[0], str) else ""
+    if existing_sql and all(f"'{state}'" in existing_sql for state in RESUME_JOB_STATES):
+        return
+
+    old_columns = {
+        info[1] for info in connection.execute("PRAGMA table_info(resume_jobs)")
+    }
+    for column, definition in (
+        ("transcript_offset", "INTEGER NOT NULL DEFAULT 0"),
+        ("baseline_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("transcript_path", "TEXT"),
+        ("turn_id", "TEXT"),
+        ("verify_until", "INTEGER NOT NULL DEFAULT 0"),
+        ("dispatch_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("api_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in old_columns:
+            connection.execute(
+                f"ALTER TABLE resume_jobs ADD COLUMN {column} {definition}"
+            )
+            old_columns.add(column)
+
+    connection.execute("DROP INDEX IF EXISTS resume_jobs_scope_created")
+    connection.execute("DROP TABLE IF EXISTS resume_jobs_migrated")
+    connection.execute(resume_jobs_table_sql("resume_jobs_migrated"))
+    copied_columns = [column for column in RESUME_JOB_COLUMNS if column in old_columns]
+    column_list = ", ".join(copied_columns)
+    connection.execute(
+        f"INSERT INTO resume_jobs_migrated ({column_list}) "
+        f"SELECT {column_list} FROM resume_jobs"
+    )
+    connection.execute("DROP TABLE resume_jobs")
+    connection.execute("ALTER TABLE resume_jobs_migrated RENAME TO resume_jobs")
+
+
 def connect() -> sqlite3.Connection:
     path = state_database()
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
     connection.execute(f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
-    connection.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS streaks (
-            scope_hash TEXT PRIMARY KEY,
-            attempts INTEGER NOT NULL CHECK(
-                attempts >= 0 AND attempts <= {MAX_MAX_ATTEMPTS}
-            ),
-            assistant_hash TEXT,
-            last_seen INTEGER NOT NULL CHECK(last_seen >= 0),
-            progress TEXT
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS streaks (
+                scope_hash TEXT PRIMARY KEY,
+                attempts INTEGER NOT NULL CHECK(
+                    attempts >= 0 AND attempts <= {MAX_MAX_ATTEMPTS}
+                ),
+                assistant_hash TEXT,
+                last_seen INTEGER NOT NULL CHECK(last_seen >= 0),
+                progress TEXT
+            )
+            """
         )
-        """
-    )
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(streaks)")}
-    if "progress" not in columns:
-        connection.execute("ALTER TABLE streaks ADD COLUMN progress TEXT")
-    connection.commit()
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(streaks)")}
+        if "progress" not in columns:
+            connection.execute("ALTER TABLE streaks ADD COLUMN progress TEXT")
+        connection.execute(resume_jobs_table_sql(if_not_exists=True))
+        migrate_resume_jobs_state_constraint(connection)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS resume_jobs_scope_created "
+            "ON resume_jobs(scope_hash, created_at)"
+        )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        connection.close()
+        raise
     return connection
 
 
@@ -880,7 +1031,9 @@ def run_failure_hook(payload: dict[str, Any]) -> int:
     所以这里不能靠 decision 让 Codex 续跑，只能自己拉起续跑进程；
     systemMessage 只是让 TUI 上有一行提示。
     """
-    if not handle_failure(payload):
+    mark_interrupted_jobs()
+    result = handle_failure(payload)
+    if result is None:
         return 0
     attempt = env_int(
         "DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS",
@@ -889,7 +1042,18 @@ def run_failure_hook(payload: dict[str, Any]) -> int:
         maximum=MAX_MAX_ATTEMPTS,
     )
     model = codex_model_name(payload)
-    message = f"{model} 因 API 失败中断，已退避后重新拉起续跑（上限 {attempt} 次）。"
+    job_id, launched = result
+    log_path = resume_job_log_path(job_id)
+    if launched:
+        message = (
+            f"{model} 因 API 失败中断，已安排后台续跑（上限 {attempt} 次）。"
+            f"优先投递 Codex 会话队列，失败才等待写锁；诊断日志：{log_path}"
+        )
+    else:
+        message = (
+            f"{model} 因 API 失败中断，但后台续跑没有启动。"
+            f"诊断日志：{log_path}"
+        )
     print(json.dumps({"systemMessage": message}, ensure_ascii=False))
     return 0
 
@@ -1565,7 +1729,12 @@ def parent_process_id(pid: int) -> int | None:
         return None
 
 
-def thread_writer_lock_held(session_id: str) -> bool:
+LOCK_HELD = "held"
+LOCK_FREE = "free"
+LOCK_UNKNOWN = "unknown"
+
+
+def thread_writer_lock_state(session_id: str) -> str:
     """发起回合的 Codex 进程是否还持有该会话的写锁。
 
     Codex 用 <CODEX_HOME>/thread-writer-locks/<thread>.lock 标记活跃写者，并且
@@ -1575,41 +1744,367 @@ def thread_writer_lock_held(session_id: str) -> bool:
 
     **只用共享锁探测**：Codex 的 WriterLockGuard 在 drop 时要抢独占锁来清理
     文件，探测若占独占锁会把它的清理挡回去。共享锁不会写文件，也不留下
-    任何状态。读不到锁目录时按「未持有」处理，让续跑自己去试。
+    任何状态。锁文件不存在时视为空闲；其它读锁错误返回 unknown，不能把
+    「读不到」误报成「空闲」。
     """
     if session_id.startswith("."):
-        return False
+        return LOCK_FREE
     codex_home = os.environ.get("CODEX_HOME")
     if not codex_home or not codex_home.strip():
         codex_home = str(Path.home() / ".codex")
     lock_path = Path(codex_home).expanduser() / "thread-writer-locks" / f"{session_id}.lock"
+    if not lock_path.exists():
+        return LOCK_FREE
     try:
         handle = lock_path.open("rb")
-    except OSError:
-        return False
+    except OSError as error:
+        return LOCK_FREE if isinstance(error, FileNotFoundError) else LOCK_UNKNOWN
     try:
         try:
             import fcntl
         except ImportError:
             # 非 POSIX 平台没有 fcntl，交给续跑自己去判断。
-            return False
+            return LOCK_UNKNOWN
         try:
             # LOCK_SH: 与写者的 LOCK_EX 互斥，但多个探测之间不互斥，也不妨碍
             # Codex 自己的清理流程。
             fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError:
-            return True
+            return LOCK_HELD
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            return False
+            return LOCK_FREE
         finally:
             handle.close()
     except OSError:
-        return False
+        return LOCK_UNKNOWN
 
 
-def spawn_resume(session_id: str, cwd: str | None, delay: float) -> bool:
-    """拉起一个脱离的辅助进程：先退避，等锁释放后再 resume。
+def thread_writer_lock_held(session_id: str) -> bool:
+    """兼容旧调用：只有明确 HELD 才返回 True。"""
+    return thread_writer_lock_state(session_id) == LOCK_HELD
+
+
+def lock_wait_seconds() -> float:
+    return env_float(
+        "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS",
+        DEFAULT_LOCK_WAIT_TIMEOUT_SECONDS,
+        minimum=0.0,
+        maximum=MAX_LOCK_WAIT_TIMEOUT_SECONDS,
+    )
+
+
+def lock_poll_seconds() -> float:
+    return env_float(
+        "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS",
+        DEFAULT_LOCK_POLL_INTERVAL_SECONDS,
+        minimum=0.05,
+        maximum=MAX_LOCK_POLL_INTERVAL_SECONDS,
+    )
+
+
+def queue_settle_seconds() -> float:
+    """辅助进程在退出前短暂观察一次新 turn 的窗口。"""
+    return env_float(
+        "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS",
+        DEFAULT_QUEUE_SETTLE_SECONDS,
+        minimum=0.05,
+        maximum=MAX_QUEUE_SETTLE_SECONDS,
+    )
+
+
+def queue_verify_seconds() -> float:
+    """queue 消息的持久待核对窗口，后续 hook 继续用 rollout 对账。"""
+    return env_float(
+        "DROID_AUTO_CONTINUE_QUEUE_VERIFY_SECONDS",
+        DEFAULT_QUEUE_VERIFY_SECONDS,
+        minimum=0.05,
+        maximum=MAX_QUEUE_VERIFY_SECONDS,
+    )
+
+
+def queue_command_timeout_seconds() -> float:
+    return env_float(
+        "DROID_AUTO_CONTINUE_QUEUE_TIMEOUT_SECONDS",
+        DEFAULT_QUEUE_COMMAND_TIMEOUT_SECONDS,
+        minimum=1.0,
+        maximum=MAX_QUEUE_COMMAND_TIMEOUT_SECONDS,
+    )
+
+
+def queue_resume_command(executable: str, session_id: str) -> list[str]:
+    """返回 Codex 原生的持久队列命令。
+
+    queue 会把消息写进已有会话的队列，并由原 app-server/TUI 在空闲时启动。
+    它不抢 thread writer lock，也不需要还原 provider/sandbox 参数。
+    """
+    return [
+        executable,
+        "queue",
+        "--thread",
+        session_id,
+        "--message",
+        RESUME_PROMPT,
+        "--resume",
+    ]
+
+
+def queue_failure_is_unsupported(stdout: str, stderr: str) -> bool:
+    """只把明确的 queue 不支持错误视为「消息一定未入队」。"""
+    text = f"{stdout}\n{stderr}".lower()
+    hints = (
+        "unsupported queue",
+        "unknown command queue",
+        "unknown subcommand: queue",
+        "unrecognized subcommand 'queue'",
+        'unrecognized subcommand "queue"',
+        "unexpected argument 'queue'",
+        'unexpected argument "queue"',
+        "does not support thread/queue/add",
+        "unknown variant `thread/queue/add`",
+        "method not found",
+        "experimental feature required",
+    )
+    return any(hint in text for hint in hints)
+
+
+def begin_queue_verification(
+    job_id: str,
+    *,
+    exit_code: int | None,
+    detail: str,
+) -> None:
+    verify_until = int(time.time() + queue_verify_seconds() + 0.999)
+    update_resume_job(
+        job_id,
+        state="queued",
+        exit_code=exit_code,
+        verify_until=verify_until,
+        detail=detail,
+    )
+    log_resume_event(
+        job_id,
+        "queue_verification_started",
+        verify_until=verify_until,
+        verify_seconds=queue_verify_seconds(),
+    )
+
+
+def finish_queue_verification(
+    job_id: str,
+    transcript_path: str | None,
+    turn_id: str | None,
+    *,
+    baseline_offset: int,
+    exit_code: int | None,
+    queued_detail: str,
+) -> str:
+    """等待 rollout 的真实新 turn；没有可验证上下文时保留待核对状态。"""
+    if transcript_path and wait_for_resume_turn(
+        transcript_path,
+        turn_id,
+        baseline_offset=baseline_offset,
+        timeout_seconds=queue_settle_seconds(),
+    ):
+        log_resume_event(job_id, "queue_recovered", exit_code=exit_code)
+        update_resume_job(
+            job_id,
+            state="recovered",
+            exit_code=exit_code,
+            new_turn_seen=True,
+            detail="the queued message started a new turn in the rollout",
+        )
+        return "handled"
+    log_resume_event(
+        job_id,
+        "queue_not_observed",
+        settle_seconds=queue_settle_seconds(),
+        verify_seconds=queue_verify_seconds(),
+        new_turn_seen=False,
+    )
+    update_resume_job(
+        job_id,
+        state="queued",
+        exit_code=exit_code,
+        new_turn_seen=False,
+        detail=queued_detail + "; pending later rollout reconciliation",
+    )
+    return "handled"
+
+
+def try_queue_resume(
+    executable: str,
+    session_id: str,
+    cwd: str | None,
+    job_id: str,
+    transcript_path: str | None,
+    turn_id: str | None,
+    baseline_offset: int,
+) -> str:
+    """把恢复消息持久交给已有会话；返回 ``handled`` / ``fallback`` / ``fatal``。
+
+    queue 返回 0 只证明消息已进入持久队列；非零退出也不自动等于未入队，
+    因为服务端可能已经提交、客户端随后才失败。只有明确的「不支持 queue」
+    错误才回退 exec，其它非零和超时都进入待核对，避免同一 turn 投递两次。
+    """
+    command = queue_resume_command(executable, session_id)
+    log_resume_event(job_id, "queue_started", command=sanitized_command(command))
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd if cwd else None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as error:
+        log_resume_event(job_id, "queue_launch_failed", error=str(error))
+        update_resume_job(
+            job_id,
+            state="failed_to_launch",
+            detail=f"codex queue launch failed: {error}",
+        )
+        return "fatal"
+    if not update_resume_job(job_id, state="queued", resume_pid=process.pid):
+        terminate_process_group(process)
+        process.communicate()
+        log_resume_event(job_id, "queue_job_state_update_failed")
+        return "fatal"
+    try:
+        stdout_bytes, stderr_bytes = process.communicate(
+            timeout=queue_command_timeout_seconds(),
+        )
+    except subprocess.TimeoutExpired:
+        terminate_process_group(process)
+        stdout_bytes, stderr_bytes = process.communicate()
+        stdout_tail = sanitized_text(tail_text(stdout_bytes))
+        stderr_tail = sanitized_text(tail_text(stderr_bytes))
+        try:
+            process_returncode: int | None = process.returncode
+        except (AttributeError, ValueError):
+            process_returncode = None
+        log_resume_event(
+            job_id,
+            "queue_timed_out",
+            exit_code=process_returncode,
+            timeout_seconds=queue_command_timeout_seconds(),
+            stdout_tail=stdout_tail,
+            stderr_tail=stderr_tail,
+        )
+        begin_queue_verification(
+            job_id,
+            exit_code=process_returncode,
+            detail=(
+                "codex queue timed out with an unknown outcome; "
+                "waiting for a rollout turn without retrying"
+            ),
+        )
+        return finish_queue_verification(
+            job_id,
+            transcript_path,
+            turn_id,
+            baseline_offset=baseline_offset,
+            exit_code=process_returncode,
+            queued_detail=(
+                "codex queue timed out and no new turn appeared during verification; "
+                "the queue outcome is unknown"
+            ),
+        )
+
+    stdout_tail = sanitized_text(tail_text(stdout_bytes))
+    stderr_tail = sanitized_text(tail_text(stderr_bytes))
+    log_resume_event(
+        job_id,
+        "queue_command_completed",
+        exit_code=process.returncode,
+        stdout_tail=stdout_tail,
+        stderr_tail=stderr_tail,
+    )
+    if process.returncode != 0:
+        detail = stderr_tail or stdout_tail or "non-zero exit"
+        if queue_failure_is_unsupported(stdout_tail, stderr_tail):
+            update_resume_job(
+                job_id,
+                state="waiting_lock",
+                exit_code=process.returncode,
+                detail=f"codex queue is unsupported; falling back to exec resume: {detail[-1000:]}",
+            )
+            return "fallback"
+        begin_queue_verification(
+            job_id,
+            exit_code=process.returncode,
+            detail=(
+                "codex queue failed with an unknown outcome; "
+                "waiting for a rollout turn without retrying"
+            ),
+        )
+        return finish_queue_verification(
+            job_id,
+            transcript_path,
+            turn_id,
+            baseline_offset=baseline_offset,
+            exit_code=process.returncode,
+            queued_detail=(
+                "codex queue exited non-zero with an unknown outcome and no new turn "
+                "appeared during verification"
+            ),
+        )
+
+    begin_queue_verification(
+        job_id,
+        exit_code=0,
+        detail="the message was durably queued; verifying that a new turn starts",
+    )
+    return finish_queue_verification(
+        job_id,
+        transcript_path,
+        turn_id,
+        baseline_offset=baseline_offset,
+        exit_code=0,
+        queued_detail=(
+            "the message was durably queued, but no new turn appeared before "
+            "the verification window expired"
+        ),
+    )
+
+
+def codex_executable() -> str | None:
+    return shutil.which("codex")
+
+
+def wait_for_resume_turn(
+    transcript_path: str | None,
+    turn_id: str | None,
+    *,
+    baseline_offset: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    poll = min(1.0, max(0.05, timeout_seconds / 10))
+    while True:
+        if turn_has_advanced(
+            transcript_path,
+            turn_id,
+            baseline_offset=baseline_offset,
+            allow_any_new_turn=not turn_id,
+        ):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(poll, remaining))
+
+
+def spawn_resume(
+    session_id: str,
+    cwd: str | None,
+    delay: float,
+    job_id: str,
+    transcript_path: str | None = None,
+    turn_id: str | None = None,
+) -> bool:
+    """拉起一个脱离的辅助进程：先退避，优先入队，必要时再等锁 resume。
 
     两件事都必须离开 hook 进程：
 
@@ -1626,30 +2121,69 @@ def spawn_resume(session_id: str, cwd: str | None, delay: float) -> bool:
     实测过这个坑：续跑进程会拿不到 `-s danger-full-access`，沙箱静默降级成
     read-only，模型接着写文件全部失败。
     """
-    executable = shutil.which("codex")
-    if not executable:
-        return False
+    log_path = resume_job_log_path(job_id)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        # 日志是诊断用的，目录不可写不能阻断真正的恢复动作。
+        log_resume_event(job_id, "log_directory_unavailable", error=str(error))
+    log_resume_event(job_id, "helper_spawn_requested", delay_seconds=delay)
     overrides = json.dumps(resume_launch_overrides(), ensure_ascii=False)
+    if not shutil.which("codex"):
+        update_resume_job(
+            job_id,
+            state="failed_to_launch",
+            detail="codex executable was not found on PATH",
+        )
+        log_resume_event(job_id, "codex_not_found")
+        return False
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
-        "--resume-after-lock",
+        "--resume-job",
+        job_id,
         session_id,
         cwd or "",
         f"{delay:.3f}",
         overrides,
+        transcript_path or "",
+        turn_id or "",
     ]
     try:
-        subprocess.Popen(
+        log_handle = log_path.open("ab")
+    except OSError:
+        log_handle = None
+    try:
+        process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_handle if log_handle is not None else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if log_handle is not None else subprocess.DEVNULL,
             start_new_session=True,
             env=dict(os.environ),
         )
-    except (OSError, ValueError):
+    except (OSError, ValueError) as error:
+        update_resume_job(
+            job_id,
+            state="failed_to_launch",
+            detail=f"helper launch failed: {error}",
+        )
+        log_resume_event(
+            job_id,
+            "helper_spawn_failed",
+            error=str(error),
+        )
         return False
+    finally:
+        if log_handle is not None:
+            log_handle.close()
+    update_resume_job(
+        job_id,
+        state="scheduled",
+        resume_pid=process.pid,
+        increment_api_attempts=True,
+    )
+    log_resume_event(job_id, "helper_started", pid=process.pid)
     return True
 
 
@@ -1658,64 +2192,768 @@ def resume_after_lock(
     cwd: str | None,
     delay: float,
     overrides: list[str],
+    *,
+    job_id: str | None = None,
+    transcript_path: str | None = None,
+    turn_id: str | None = None,
 ) -> int:
-    """辅助进程主体：退避 → 等写锁释放 → 续跑。
+    """辅助进程主体：退避 → 优先投递 Codex 队列 → 必要时等锁后 resume。
 
-    `overrides` 由 hook 进程在启动本进程时算好传进来，不能在这里重算：
-    那时 hook 已经退出，父进程换人了，还原不出原始启动参数。
+    队列路径能接管仍在运行的 TUI，并且沿用原 thread 的模型、provider 和
+    沙箱设置。只有 queue 不可用时才回退到 ``codex exec resume``；那条路径
+    需要的 ``overrides`` 仍由 hook 进程提前算好传入。
     """
-    if delay > 0:
-        time.sleep(delay)
-    deadline = time.time() + LOCK_WAIT_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        if not thread_writer_lock_held(session_id):
-            break
-        time.sleep(LOCK_POLL_INTERVAL_SECONDS)
-    else:
-        # 等到超时仍被锁着：Codex 那边还活着，交给下一次失败或用户手工继续。
+    job_id = job_id or digest(
+        "resume-job:"
+        + session_id
+        + ":"
+        + (turn_id if turn_id else digest(RESUME_PROMPT))
+    )
+    ensure_resume_job_for_helper(job_id, session_id, turn_id, transcript_path)
+    baseline_offset = resume_job_baseline_offset(job_id)
+    log_resume_event(
+        job_id,
+        "helper_running",
+        delay_seconds=delay,
+        lock_wait_seconds=lock_wait_seconds(),
+        poll_seconds=lock_poll_seconds(),
+    )
+    update_resume_job(job_id, state="waiting_lock")
+    try:
+        if delay > 0:
+            time.sleep(delay)
+        if turn_has_advanced(
+            transcript_path,
+            turn_id,
+            baseline_offset=baseline_offset,
+            allow_any_new_turn=not turn_id,
+        ):
+            log_resume_event(job_id, "superseded_before_lock_wait")
+            update_resume_job(job_id, state="superseded", detail="a new turn already started")
+            return 0
+
+        executable = codex_executable()
+        if not executable:
+            log_resume_event(job_id, "codex_not_found")
+            update_resume_job(
+                job_id,
+                state="failed_to_launch",
+                detail="codex executable was not found on PATH",
+            )
+            release_failure_attempt(job_id)
+            return 0
+
+        queue_result = try_queue_resume(
+            executable,
+            session_id,
+            cwd,
+            job_id,
+            transcript_path,
+            turn_id,
+            baseline_offset,
+        )
+        if queue_result == "handled":
+            return 0
+        if queue_result == "fatal":
+            return 0
+        if turn_has_advanced(
+            transcript_path,
+            turn_id,
+            baseline_offset=baseline_offset,
+            allow_any_new_turn=not turn_id,
+        ):
+            log_resume_event(job_id, "superseded_after_queue")
+            update_resume_job(job_id, state="superseded", detail="a new turn started after queueing")
+            return 0
+
+        update_resume_job(job_id, state="waiting_lock")
+        deadline = time.monotonic() + lock_wait_seconds()
+        was_held = False
+        poll = lock_poll_seconds()
+        unknown_polls = 0
+        while True:
+            if turn_has_advanced(
+                transcript_path,
+                turn_id,
+                baseline_offset=baseline_offset,
+                allow_any_new_turn=not turn_id,
+            ):
+                log_resume_event(job_id, "superseded_during_lock_wait")
+                update_resume_job(
+                    job_id,
+                    state="superseded",
+                    detail="a new turn started while waiting for the writer lock",
+                )
+                return 0
+            lock_state = thread_writer_lock_state(session_id)
+            if lock_state == LOCK_FREE:
+                break
+            if lock_state == LOCK_HELD:
+                was_held = True
+            else:
+                unknown_polls += 1
+            if time.monotonic() >= deadline:
+                log_resume_event(
+                    job_id,
+                    "lock_wait_timed_out",
+                    waited_seconds=lock_wait_seconds(),
+                    last_lock_state=lock_state,
+                )
+                update_resume_job(
+                    job_id,
+                    state="blocked_active_writer",
+                    detail=(
+                        f"thread writer lock state was {lock_state} after "
+                        f"{lock_wait_seconds():g}s ({unknown_polls} unknown polls)"
+                    ),
+                )
+                return 0
+            if lock_state == LOCK_UNKNOWN and unknown_polls >= 3:
+                log_resume_event(job_id, "lock_state_unknown", polls=unknown_polls)
+            time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+        if was_held:
+            log_resume_event(job_id, "lock_released")
+        else:
+            log_resume_event(job_id, "lock_not_held")
+
+        if turn_has_advanced(
+            transcript_path,
+            turn_id,
+            baseline_offset=baseline_offset,
+            allow_any_new_turn=not turn_id,
+        ):
+            log_resume_event(job_id, "superseded_before_dispatch")
+            update_resume_job(job_id, state="superseded", detail="a new turn started before dispatch")
+            return 0
+
+        command = [
+            executable,
+            "exec",
+            "resume",
+            *overrides,
+            "--skip-git-repo-check",
+            session_id,
+            RESUME_PROMPT,
+        ]
+        update_resume_job(job_id, state="dispatching")
+        log_resume_event(
+            job_id,
+            "dispatch_started",
+            command=sanitized_command(command),
+        )
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd if cwd else None,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as error:
+            log_resume_event(job_id, "dispatch_launch_failed", error=str(error))
+            update_resume_job(
+                job_id,
+                state="failed_to_launch",
+                detail=f"codex resume launch failed: {error}",
+            )
+            release_failure_attempt(job_id)
+            return 0
+        update_resume_job(
+            job_id,
+            state="dispatching",
+            increment_dispatch_attempts=True,
+            resume_pid=process.pid,
+        )
+        try:
+            stdout_bytes, stderr_bytes = process.communicate(
+                timeout=resume_process_timeout_seconds(),
+            )
+        except subprocess.TimeoutExpired:
+            terminate_process_group(process)
+            stdout_bytes, stderr_bytes = process.communicate()
+            stdout_tail = sanitized_text(tail_text(stdout_bytes))
+            stderr_tail = sanitized_text(tail_text(stderr_bytes))
+            log_resume_event(
+                job_id,
+                "dispatch_timed_out",
+                timeout_seconds=resume_process_timeout_seconds(),
+                stdout_tail=stdout_tail,
+                stderr_tail=stderr_tail,
+            )
+            update_resume_job(
+                job_id,
+                state="failed",
+                exit_code=None,
+                detail="codex resume timed out",
+            )
+            return 0
+        stdout_tail = sanitized_text(tail_text(stdout_bytes))
+        stderr_tail = sanitized_text(tail_text(stderr_bytes))
+        new_turn = turn_has_advanced(
+            transcript_path,
+            turn_id,
+            baseline_offset=baseline_offset,
+            allow_any_new_turn=not turn_id,
+        )
+        log_resume_event(
+            job_id,
+            "dispatch_completed",
+            exit_code=process.returncode,
+            new_turn_seen=new_turn,
+            stdout_tail=stdout_tail,
+            stderr_tail=stderr_tail,
+        )
+        if process.returncode != 0:
+            detail = stderr_tail or stdout_tail or "codex resume exited non-zero"
+            if "already has an active writer" in detail.lower() and not new_turn:
+                log_resume_event(job_id, "dispatch_writer_conflict_queue_fallback")
+                queue_result = try_queue_resume(
+                    executable,
+                    session_id,
+                    cwd,
+                    job_id,
+                    transcript_path,
+                    turn_id,
+                    baseline_offset,
+                )
+                if queue_result in {"handled", "fatal"}:
+                    return 0
+            update_resume_job(
+                job_id,
+                state="failed",
+                exit_code=process.returncode,
+                new_turn_seen=new_turn,
+                detail=detail[-1000:],
+            )
+        elif new_turn:
+            update_resume_job(
+                job_id,
+                state="recovered",
+                exit_code=0,
+                new_turn_seen=True,
+                detail="a new turn appeared in the rollout",
+            )
+        else:
+            update_resume_job(
+                job_id,
+                state="completed_unverified",
+                exit_code=0,
+                new_turn_seen=False,
+                detail="codex resume exited zero but no new turn appeared",
+            )
+        return 0
+    except Exception as error:  # noqa: BLE001 - helper must always persist a terminal state
+        log_resume_event(job_id, "helper_crashed", error=repr(error))
+        update_resume_job(job_id, state="failed", detail=f"helper crashed: {error}")
         return 0
 
-    executable = shutil.which("codex")
-    if not executable:
-        return 0
-    command = [
-        executable,
-        "exec",
-        "resume",
-        *overrides,
-        "--skip-git-repo-check",
-        session_id,
-        RESUME_PROMPT,
-    ]
+
+def process_is_alive(pid: int | None) -> bool:
+    if type(pid) is not int or pid <= 0:
+        return False
     try:
-        subprocess.run(
-            command,
-            cwd=cwd if cwd else None,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except (OSError, ValueError):
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def mark_interrupted_jobs() -> None:
+    """对账仍有恢复证据的 job，再回收确实失去 helper 的遗留状态。
+
+    queue 成功后会先停在 ``queued``，因为消息已持久化但 rollout 尚未证明新
+    turn 已开始。后续 hook 必须先读持久化的 transcript baseline；看到新 turn
+    就转 ``recovered``。验证期未过的 queued 不能因为 helper 已退出而判失败。
+    只有验证期已过，或 helper 超过运行窗口且 PID 已不存在时，才落终态。
+    """
+    now = int(time.time())
+    cutoff = now - int(resume_process_timeout_seconds())
+    try:
+        connection = connect()
+    except (OSError, sqlite3.Error):
+        return
+    try:
+        rows = connection.execute(
+            "SELECT job_id, state, transcript_path, turn_id, transcript_offset, "
+            "verify_until, resume_pid, updated_at, detail "
+            "FROM resume_jobs "
+            "WHERE state IN ('scheduled', 'queued', 'waiting_lock', 'dispatching') "
+            "ORDER BY updated_at ASC LIMIT 100"
+        ).fetchall()
+    except sqlite3.Error:
+        connection.close()
+        return
+
+    updates: list[
+        tuple[str, str, str, int, int, str | None, int, str | None]
+    ] = []
+    try:
+        for (
+            job_id,
+            state,
+            transcript_path,
+            turn_id,
+            transcript_offset,
+            verify_until,
+            resume_pid,
+            updated_at,
+            detail,
+        ) in rows:
+            if not isinstance(job_id, str) or state not in RESUME_ACTIVE_STATES:
+                continue
+            baseline = transcript_offset if type(transcript_offset) is int else 0
+            failed_turn = turn_id if isinstance(turn_id, str) else None
+            path = transcript_path if isinstance(transcript_path, str) else None
+            if path and failed_turn and turn_id_after_baseline(
+                path,
+                failed_turn,
+                baseline_offset=baseline,
+            ):
+                updates.append(
+                    (
+                        "recovered",
+                        "a new turn appeared in the rollout during reconciliation",
+                        job_id,
+                        int(updated_at) if type(updated_at) is int else 0,
+                        int(updated_at) if type(updated_at) is int else 0,
+                        None,
+                        now,
+                        None,
+                    )
+                )
+                continue
+            if state == "queued":
+                deadline = verify_until if type(verify_until) is int else 0
+                if deadline and now < deadline:
+                    continue
+                if not deadline and (type(updated_at) is not int or updated_at >= cutoff):
+                    continue
+                previous = detail if isinstance(detail, str) else ""
+                updates.append(
+                    (
+                        "completed_unverified",
+                        (previous + "; ") if previous else ""
+                        + "queued message was not followed by a new turn before the verification window expired",
+                        job_id,
+                        int(updated_at) if type(updated_at) is int else 0,
+                        int(updated_at) if type(updated_at) is int else 0,
+                        None,
+                        now,
+                        "queued verification window expired",
+                    )
+                )
+                continue
+            if type(updated_at) is not int or updated_at >= cutoff:
+                continue
+            if process_is_alive(resume_pid if type(resume_pid) is int else None):
+                continue
+            updates.append(
+                (
+                    "failed",
+                    "helper stopped without recording a terminal state",
+                    job_id,
+                    int(updated_at),
+                    int(updated_at),
+                    None,
+                    now,
+                    "helper stopped unexpectedly",
+                )
+            )
+    finally:
+        connection.close()
+
+    for (
+        state,
+        detail,
+        job_id,
+        _created,
+        expected_updated,
+        _pid,
+        updated,
+        reconcile_reason,
+    ) in updates:
+        try:
+            connection = connect()
+        except (OSError, sqlite3.Error):
+            return
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE resume_jobs SET state = ?, detail = ?, updated_at = ?, "
+                "new_turn_seen = CASE WHEN ? = 'recovered' THEN 1 ELSE new_turn_seen END "
+                "WHERE job_id = ? AND updated_at = ? "
+                "AND state IN ('scheduled', 'queued', 'waiting_lock', 'dispatching')",
+                (state, detail[:4000], updated, state, job_id, expected_updated),
+            )
+            connection.commit()
+            if cursor.rowcount:
+                log_resume_event(
+                    job_id,
+                    "job_reconciled",
+                    state=state,
+                    reason=reconcile_reason,
+                    detail=detail,
+                )
+        except (OSError, sqlite3.Error):
+            connection.rollback()
+        finally:
+            connection.close()
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    """结束 dispatch 及其子进程，再回收输出管道。
+
+    shell 启动的 codex 可能再拉起 MCP、工具或代理进程；只 kill 直接子进程
+    会让这些孙进程继续持有 stdout/stderr，随后的 communicate() 永远等不到 EOF，
+    job 就会卡在 dispatching。dispatch 因此以新 session 启动，整组终止。
+    """
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def resume_job_log_path(job_id: str) -> Path:
+    safe = "".join(character for character in job_id if character.isalnum() or character in "-_")
+    return resume_log_directory() / f"{safe or 'job'}.jsonl"
+
+
+def log_resume_event(job_id: str, event: str, **fields: Any) -> None:
+    """追加一条诊断事件；日志不可写不能阻断恢复流程。"""
+    record: dict[str, Any] = {
+        "timestamp": utc_timestamp(),
+        "job_id": job_id,
+        "event": event,
+    }
+    record.update(fields)
+    try:
+        path = resume_job_log_path(job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        return
+
+
+def tail_text(value: bytes | str | None, limit: int = MAX_RESUME_LOG_TAIL_BYTES) -> str:
+    if value is None:
+        return ""
+    text = value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+    return text[-limit:]
+
+
+def sanitized_text(value: str, limit: int = 1000) -> str:
+    text = re.sub(
+        r"(?i)((?:api[_-]?key|access[_-]?token|authorization|secret)\s*[:=]\s*)[^\s,;]+",
+        r"\1<redacted>",
+        value,
+    )
+    return text[-limit:]
+
+
+def sanitized_command(command: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    for item in command:
+        lowered = item.lower()
+        if any(
+            marker in lowered
+            for marker in ("api_key=", "token=", "secret=", "authorization:")
+        ):
+            sanitized.append("<redacted>")
+        elif len(item) > 1000:
+            sanitized.append(item[:1000] + "…")
+        else:
+            sanitized.append(item)
+    return sanitized
+
+
+def resume_process_timeout_seconds() -> float:
+    return env_float(
+        "DROID_AUTO_CONTINUE_RESUME_TIMEOUT_SECONDS",
+        3600.0,
+        minimum=1.0,
+        maximum=24 * 60 * 60.0,
+    )
+
+
+def transcript_line_baseline(transcript_path: str | None) -> int:
+    """返回当前完整 JSONL 行的末尾，作为后续 turn 的读取起点。
+
+    直接保存文件大小可能落在半行中间；下一次从那里 seek 会丢掉这一行的
+    开头，若它恰好是新 turn 的 task_started，就会把恢复误判为未发生。
+    """
+    if not transcript_path:
+        return 0
+    try:
+        with expand_path(transcript_path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size <= 0:
+                return 0
+            handle.seek(size - 1)
+            if handle.read(1) == b"\n":
+                return size
+            position = size
+            while position > 0:
+                chunk = max(1, min(8192, position))
+                position -= chunk
+                handle.seek(position)
+                data = handle.read(chunk)
+                newline = data.rfind(b"\n")
+                if newline >= 0:
+                    return position + newline + 1
+    except OSError:
         return 0
     return 0
 
 
-def handle_failure(payload: dict[str, Any]) -> bool:
+def turn_id_after_baseline(
+    transcript_path: str | None,
+    turn_id: str | None,
+    *,
+    baseline_offset: int | None = None,
+    allow_any_new_turn: bool = False,
+) -> str | None:
+    """返回基线之后出现的新 turn id；没有则 None。
+
+    基线之后的文件可能暂时以半行结尾。保留末尾不完整行，下一次轮询从同一
+    偏移重读该行，不能因为一次 JSON 解析失败就永远漏掉 task_started。
+
+    ``allow_any_new_turn`` 用于没有失败 turn_id 的 ad-hoc job：只要基线后
+    出现任意一个完整的新 ``task_started``，就足以证明有新一轮开始。
+    """
+    if not transcript_path or (not turn_id and not allow_any_new_turn):
+        return None
+    path = expand_path(transcript_path)
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            start = baseline_offset or 0
+            if start < 0 or start > size:
+                start = 0
+            if start > 0:
+                handle.seek(start)
+            blob = handle.read()
+    except OSError:
+        return None
+    for line in blob.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("type") != "event_msg":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "task_started":
+            continue
+        seen = payload.get("turn_id")
+        if not isinstance(seen, str) or not seen.strip():
+            continue
+        seen = seen.strip()
+        if allow_any_new_turn or seen != turn_id:
+            return seen
+    return None
+
+
+def turn_has_advanced(
+    transcript_path: str | None,
+    turn_id: str | None,
+    *,
+    baseline_offset: int | None = None,
+    allow_any_new_turn: bool = False,
+) -> bool:
+    return (
+        turn_id_after_baseline(
+            transcript_path,
+            turn_id,
+            baseline_offset=baseline_offset,
+            allow_any_new_turn=allow_any_new_turn,
+        )
+        is not None
+    )
+
+
+def update_resume_job(
+    job_id: str,
+    *,
+    state: str,
+    detail: str | None = None,
+    resume_pid: int | None = None,
+    exit_code: int | None = None,
+    new_turn_seen: bool | None = None,
+    verify_until: int | None = None,
+    increment_dispatch_attempts: bool = False,
+    increment_api_attempts: bool = False,
+) -> bool:
+    if state not in RESUME_JOB_STATES:
+        return False
+    now = int(time.time())
+    assignments = ["state = ?", "updated_at = ?"]
+    values: list[Any] = [state, now]
+    if detail is not None:
+        assignments.append("detail = ?")
+        values.append(detail[:4000])
+    if resume_pid is not None:
+        assignments.append("resume_pid = ?")
+        values.append(resume_pid)
+    if exit_code is not None:
+        assignments.append("exit_code = ?")
+        values.append(exit_code)
+    if new_turn_seen is not None:
+        assignments.append("new_turn_seen = ?")
+        values.append(1 if new_turn_seen else 0)
+    if verify_until is not None:
+        assignments.append("verify_until = ?")
+        values.append(verify_until)
+    if increment_dispatch_attempts:
+        assignments.append("dispatch_attempts = dispatch_attempts + 1")
+    if increment_api_attempts:
+        assignments.append("api_attempts = api_attempts + 1")
+    values.append(job_id)
+    try:
+        connection = connect()
+    except (OSError, sqlite3.Error):
+        return False
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            f"UPDATE resume_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+            values,
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+    except (OSError, sqlite3.Error):
+        connection.rollback()
+        return False
+    finally:
+        connection.close()
+
+
+def resume_job_baseline_offset(job_id: str) -> int:
+    try:
+        connection = connect()
+    except (OSError, sqlite3.Error):
+        return 0
+    try:
+        row = connection.execute(
+            "SELECT transcript_offset FROM resume_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return row[0] if row and type(row[0]) is int and row[0] >= 0 else 0
+    except sqlite3.Error:
+        return 0
+    finally:
+        connection.close()
+
+
+def ensure_resume_job_for_helper(
+    job_id: str,
+    session_id: str,
+    turn_id: str | None,
+    transcript_path: str | None = None,
+) -> None:
+    """内部 helper 的直接调用没有 hook 建 job；补一条，避免状态丢失。"""
+    now = int(time.time())
+    session_hash = digest(session_id)
+    turn_hash = digest(turn_id or "")
+    baseline = transcript_line_baseline(transcript_path)
+    try:
+        connection = connect()
+    except (OSError, sqlite3.Error):
+        return
+    try:
+        connection.execute(
+            """
+            INSERT INTO resume_jobs (
+                job_id, scope_hash, session_hash, turn_hash, error_hash,
+                transcript_offset, baseline_at, transcript_path, turn_id,
+                state, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)
+            ON CONFLICT(job_id) DO NOTHING
+            """,
+            (
+                job_id,
+                digest("failure:" + session_id.strip()),
+                session_hash,
+                turn_hash,
+                digest("ad-hoc-helper"),
+                baseline,
+                now,
+                transcript_path,
+                turn_id,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        pass
+    finally:
+        connection.close()
+
+
+def active_attempt_owner(
+    connection: sqlite3.Connection,
+    scope_hash: str,
+    error_hash: str,
+    turn_hash: str | None,
+    now: int,
+    ttl_seconds: int,
+) -> str | None:
+    """返回仍在占用本次重试额度的 job，没有则 None。
+
+    有 turn_id 时，同一 session+turn 的任何可重试错误都只允许一个活动 job，
+    即使错误文本不同；没有 turn_id 时退回错误指纹去重，避免把不同失败误合并。
+    只把 ``scheduled`` / ``queued`` / ``waiting_lock`` / ``dispatching``
+    视为正在占用；终态 job 不再阻止下一条可重试错误。启动失败会回退重试
+    额度，但保留 job 供诊断。
+    """
+    if turn_hash is not None:
+        row = connection.execute(
+            "SELECT job_id FROM resume_jobs "
+            "WHERE scope_hash = ? AND turn_hash = ? "
+            "AND state IN ('scheduled', 'queued', 'waiting_lock', 'dispatching') "
+            "AND updated_at >= ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (scope_hash, turn_hash, now - ttl_seconds),
+        ).fetchone()
+    else:
+        row = connection.execute(
+            "SELECT job_id FROM resume_jobs "
+            "WHERE scope_hash = ? AND error_hash = ? "
+            "AND state IN ('scheduled', 'queued', 'waiting_lock', 'dispatching') "
+            "AND updated_at >= ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (scope_hash, error_hash, now - ttl_seconds),
+        ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def handle_failure(payload: dict[str, Any]) -> tuple[str, bool] | None:
     """PostModelRequest 报来的 API 失败：退避后重新拉起续跑。
 
-    返回 True 表示已经安排了续跑，调用方据此输出 systemMessage。
+    返回 (job_id, helper 是否启动) 表示已经建立恢复 job；None 表示这次不处理。
     """
     status = payload.get("status")
     if status != "failed":
-        return False
+        return None
     message = payload.get("error")
     if not isinstance(message, str) or not failure_is_retryable(message):
-        return False
+        return None
 
     session_id = payload.get("session_id")
     if not isinstance(session_id, str) or not session_id.strip():
-        return False
+        return None
     cwd = payload.get("cwd")
     if not isinstance(cwd, str):
         cwd = None
@@ -1727,13 +2965,241 @@ def handle_failure(payload: dict[str, Any]) -> bool:
         maximum=MAX_MAX_ATTEMPTS,
     )
     if max_attempts <= 0:
-        return False
+        return None
 
-    attempt = claim_failure_attempt(session_id, message, max_attempts=max_attempts)
-    if attempt is None:
-        return False
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        turn_id = None
+    transcript_path = payload.get("transcript_path")
+    if not isinstance(transcript_path, str) or not transcript_path.strip():
+        transcript_path = None
 
-    return spawn_resume(session_id.strip(), cwd, failure_delay_seconds(attempt))
+    claim = claim_failure_attempt_with_job(
+        session_id,
+        message,
+        max_attempts=max_attempts,
+        turn_id=turn_id,
+        transcript_path=transcript_path,
+    )
+    if claim is None:
+        return None
+
+    attempt, job_id = claim
+    launched = spawn_resume(
+        session_id.strip(),
+        cwd,
+        failure_delay_seconds(attempt),
+        job_id,
+        transcript_path,
+        turn_id,
+    )
+    if not launched:
+        release_failure_attempt(job_id)
+    return job_id, launched
+
+
+def claim_failure_attempt_with_job(
+    session_id: str,
+    message: str,
+    *,
+    max_attempts: int,
+    turn_id: str | None,
+    transcript_path: str | None,
+) -> tuple[int, str] | None:
+    """在同一个事务里记 attempt 并建立可追踪的 resume job。
+
+    有 turn_id 时，job 的唯一键是 session + turn：同一轮先报 429、再报
+    stream disconnected，也不能投递两次续跑，只会更新已有 job 的诊断信息。
+    没有 turn_id 时保留错误指纹，避免把同一会话里的不同失败错误合并。
+    """
+    ttl_seconds = env_int(
+        "DROID_AUTO_CONTINUE_STATE_TTL_SECONDS",
+        DEFAULT_STATE_TTL_SECONDS,
+        minimum=300,
+        maximum=7 * 24 * 60 * 60,
+    )
+    now = int(time.time())
+    scope_hash = digest("failure:" + session_id.strip())
+    error_hash = digest(" ".join(message.split())[:2000])
+    turn_hash = digest(turn_id) if turn_id else None
+    job_id = digest(
+        "resume-job:"
+        + session_id.strip()
+        + ":"
+        + (turn_id if turn_id else error_hash)
+    )
+    baseline = transcript_line_baseline(transcript_path)
+    try:
+        connection = connect()
+    except (OSError, sqlite3.Error):
+        return None
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM streaks WHERE last_seen < ?", (now - ttl_seconds,))
+        existing_job = connection.execute(
+            "SELECT state, error_hash, transcript_path, turn_id, transcript_offset "
+            "FROM resume_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if existing_job is not None:
+            state, previous_error_hash, previous_path, previous_turn, previous_offset = (
+                existing_job
+            )
+            if state != "failed_to_launch":
+                # 同一 turn 的后续错误只补诊断信息；绝不启动第二个 helper。
+                updates = ["error_hash = ?", "updated_at = ?"]
+                values: list[Any] = [error_hash, now]
+                if state == "scheduled":
+                    updates.append("detail = ?")
+                    values.append(
+                        f"later retryable error in the same turn: {message.strip()[:1000]}"
+                    )
+                if not previous_path and transcript_path:
+                    updates.append("transcript_path = ?")
+                    values.append(transcript_path)
+                if not previous_turn and turn_id:
+                    updates.append("turn_id = ?")
+                    values.append(turn_id)
+                if (not previous_offset) and baseline:
+                    updates.append("transcript_offset = ?")
+                    values.append(baseline)
+                values.append(job_id)
+                connection.execute(
+                    f"UPDATE resume_jobs SET {', '.join(updates)} WHERE job_id = ?",
+                    values,
+                )
+                connection.commit()
+                return None
+            # 启动失败没有真正发出续跑；保留 job_id 的日志，但允许下一次
+            # 同一失败重新建立可执行的 job。
+            connection.execute("DELETE FROM resume_jobs WHERE job_id = ?", (job_id,))
+
+        active_job = active_attempt_owner(
+            connection,
+            scope_hash,
+            error_hash,
+            turn_hash,
+            now,
+            ttl_seconds,
+        )
+        if active_job is not None:
+            connection.execute(
+                "UPDATE resume_jobs SET error_hash = ?, updated_at = ?, "
+                "detail = 'a later retryable error arrived while recovery was active' "
+                "WHERE job_id = ?",
+                (error_hash, now, active_job),
+            )
+            connection.commit()
+            return None
+
+        row = connection.execute(
+            "SELECT attempts, assistant_hash, last_seen FROM streaks WHERE scope_hash = ?",
+            (scope_hash,),
+        ).fetchone()
+        if row is None:
+            attempts = 0
+        else:
+            stored_attempts, _, _ = row
+            if type(stored_attempts) is not int or stored_attempts < 0:
+                connection.commit()
+                return None
+            attempts = stored_attempts
+        # 同一 turn 的重复投递由上面的 job_id / active_owner 去重；不同 turn
+        # 即使是同一句 429，也必须消耗新的 API attempt。
+        next_attempt = attempts + 1
+        if next_attempt > max_attempts:
+            connection.execute(
+                """
+                INSERT INTO streaks (scope_hash, attempts, assistant_hash, last_seen, progress)
+                VALUES (?, ?, ?, ?, NULL)
+                ON CONFLICT(scope_hash) DO UPDATE SET
+                    attempts = excluded.attempts,
+                    assistant_hash = excluded.assistant_hash,
+                    last_seen = excluded.last_seen
+                """,
+                (scope_hash, next_attempt, error_hash, now),
+            )
+            connection.commit()
+            return None
+        connection.execute(
+            """
+            INSERT INTO streaks (scope_hash, attempts, assistant_hash, last_seen, progress)
+            VALUES (?, ?, ?, ?, NULL)
+            ON CONFLICT(scope_hash) DO UPDATE SET
+                attempts = excluded.attempts,
+                assistant_hash = excluded.assistant_hash,
+                last_seen = excluded.last_seen
+            """,
+            (scope_hash, next_attempt, error_hash, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO resume_jobs (
+                job_id, scope_hash, session_hash, turn_hash, error_hash,
+                transcript_offset, baseline_at, transcript_path, turn_id,
+                state, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)
+            """,
+            (
+                job_id,
+                scope_hash,
+                digest(session_id.strip()),
+                digest(turn_id or ""),
+                error_hash,
+                baseline,
+                now,
+                transcript_path,
+                turn_id,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+        return next_attempt, job_id
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        connection.rollback()
+        return None
+    finally:
+        connection.close()
+
+
+def release_failure_attempt(job_id: str) -> None:
+    """启动失败没有真正续跑，回退这次 API attempt。
+
+    只回退仍处于 ``failed_to_launch`` 的 job，避免把已经成功启动、随后
+    失败的后台任务误算成没有发生。streaks 的 assistant_hash 只和这个 job
+    的错误指纹一致时才回退，防止并发 turn 互相改坏计数。
+    """
+    try:
+        connection = connect()
+    except (OSError, sqlite3.Error):
+        return
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT scope_hash, error_hash, state FROM resume_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None or row[2] != "failed_to_launch":
+            connection.commit()
+            return
+        scope_hash, error_hash, _ = row
+        streak = connection.execute(
+            "SELECT attempts, assistant_hash FROM streaks WHERE scope_hash = ?",
+            (scope_hash,),
+        ).fetchone()
+        if streak is not None:
+            attempts, assistant_hash = streak
+            if type(attempts) is int and attempts > 0 and assistant_hash == error_hash:
+                connection.execute(
+                    "UPDATE streaks SET attempts = ? WHERE scope_hash = ?",
+                    (attempts - 1, scope_hash),
+                )
+        connection.commit()
+    except (OSError, sqlite3.Error):
+        connection.rollback()
+    finally:
+        connection.close()
 
 
 def claim_failure_attempt(
@@ -1893,6 +3359,7 @@ def main() -> int:
     payload = read_payload()
     if payload is None:
         return 0
+    mark_interrupted_jobs()
     event = payload.get("hook_event_name")
     if event == "PostModelRequest":
         return run_failure_hook(payload)
@@ -1977,23 +3444,43 @@ def main() -> int:
 
 if __name__ == "__main__":
     # 内部辅助模式：hook 进程不能等锁，退避和续跑都在脱离的子进程里跑。
-    if len(sys.argv) >= 6 and sys.argv[1] == "--resume-after-lock":
+    if len(sys.argv) >= 6 and sys.argv[1] in {"--resume-job", "--resume-after-lock"}:
+        helper_mode = sys.argv[1]
+        if helper_mode == "--resume-job":
+            helper_session_id = sys.argv[3]
+            helper_cwd = sys.argv[4] or None
+            delay_index = 5
+            overrides_index = 6
+            job_id = sys.argv[2]
+            transcript_path = sys.argv[7] if len(sys.argv) > 7 else None
+            turn_id = sys.argv[8] if len(sys.argv) > 8 else None
+        else:
+            helper_session_id = sys.argv[2]
+            helper_cwd = sys.argv[3] or None
+            delay_index = 4
+            overrides_index = 5
+            job_id = None
+            transcript_path = None
+            turn_id = None
         try:
-            requested_delay = float(sys.argv[4])
-        except ValueError:
+            requested_delay = float(sys.argv[delay_index])
+        except (IndexError, ValueError):
             requested_delay = 0.0
         try:
-            parsed_overrides = json.loads(sys.argv[5])
-        except json.JSONDecodeError:
+            parsed_overrides = json.loads(sys.argv[overrides_index])
+        except (IndexError, json.JSONDecodeError):
             parsed_overrides = []
         overrides = [item for item in parsed_overrides if isinstance(item, str)] \
             if isinstance(parsed_overrides, list) else []
         raise SystemExit(
             resume_after_lock(
-                sys.argv[2],
-                sys.argv[3] or None,
+                helper_session_id,
+                helper_cwd,
                 max(0.0, requested_delay),
                 overrides,
+                job_id=job_id,
+                transcript_path=transcript_path or None,
+                turn_id=turn_id or None,
             )
         )
     raise SystemExit(main())

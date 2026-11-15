@@ -37,7 +37,84 @@ ENV_VARS = {
     "DROID_AUTO_CONTINUE_FAILURE_MAX_ATTEMPTS",
     "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY",
     "DROID_AUTO_CONTINUE_FAILURE_MAX_DELAY",
+    "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS",
+    "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS",
+    "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS",
+    "DROID_AUTO_CONTINUE_QUEUE_VERIFY_SECONDS",
+    "DROID_AUTO_CONTINUE_QUEUE_TIMEOUT_SECONDS",
+    "DROID_AUTO_CONTINUE_RESUME_TIMEOUT_SECONDS",
 }
+
+
+def write_fake_codex(
+    root: Path,
+    *,
+    queue_exit: int = 0,
+    exec_exit: int = 0,
+    queue_message: str = "",
+    exec_message: str = "",
+    queue_append_task: str | None = None,
+    exec_append_task: str | None = None,
+    queue_sleep: float = 0,
+) -> Path:
+    """写一个只记录调用的假 Codex，按子命令模拟成功或失败。"""
+    calls = root / "calls.jsonl"
+    fake = root / "codex"
+    transcript = root / "rollout.jsonl"
+    task_append = ""
+    if queue_append_task:
+        task_record = {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": queue_append_task},
+        }
+        task_append = (
+            f"with open({str(transcript)!r}, 'a', encoding='utf-8') as handle:\n"
+            f"    handle.write(json.dumps({task_record!r}, ensure_ascii=False) + chr(10))\n"
+        )
+    exec_append = ""
+    if exec_append_task:
+        task_record = {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": exec_append_task},
+        }
+        exec_append = (
+            f"with open({str(transcript)!r}, 'a', encoding='utf-8') as handle:\n"
+            f"    handle.write(json.dumps({task_record!r}, ensure_ascii=False) + chr(10))\n"
+        )
+    pause = f"time.sleep({queue_sleep!r})\n" if queue_sleep > 0 else ""
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, time\n"
+        f"open({str(calls)!r}, 'a', encoding='utf-8').write("
+        "json.dumps(sys.argv[1:], ensure_ascii=False) + chr(10))\n"
+        "argv = sys.argv[1:]\n"
+        f"if argv[:1] == ['queue']:\n"
+        f"    sys.stderr.write({queue_message!r})\n"
+        f"{textwrap.indent(task_append + pause, '    ')}"
+        f"    raise SystemExit({queue_exit})\n"
+        f"if argv[:2] == ['exec', 'resume']:\n"
+        f"    sys.stderr.write({exec_message!r})\n"
+        f"{textwrap.indent(exec_append, '    ')}"
+        f"    raise SystemExit({exec_exit})\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    return calls
+
+
+def append_task_started(path: Path, turn_id: str) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn_id},
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
 
 
 def write_transcript(path: Path, records: list[dict[str, object]]) -> None:
@@ -1340,6 +1417,71 @@ class CodexStopTests(unittest.TestCase):
 class FailureHookTests(unittest.TestCase):
     """Codex 在 API 层失败时只发 PostModelRequest，不发 Stop。"""
 
+    def wait_for_job(
+        self,
+        state: Path,
+        *,
+        timeout: float = 8.0,
+        states: set[str] | None = None,
+        detail_contains: str | None = None,
+    ) -> tuple[str, str, int | None, int | None]:
+        database = state / "streaks.sqlite3"
+        expected = states or {
+            "recovered",
+            "queued",
+            "completed_unverified",
+            "blocked_active_writer",
+            "failed",
+            "failed_to_launch",
+            "superseded",
+        }
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if database.exists():
+                try:
+                    connection = sqlite3.connect(str(database))
+                    row = connection.execute(
+                        "SELECT job_id, state, api_attempts, exit_code, detail "
+                        "FROM resume_jobs ORDER BY created_at DESC LIMIT 1"
+                    ).fetchone()
+                    connection.close()
+                except sqlite3.Error:
+                    row = None
+                if (
+                    row is not None
+                    and row[1] in expected
+                    and (detail_contains is None or detail_contains in (row[4] or ""))
+                ):
+                    return row[0], row[1], row[2], row[3]
+            time.sleep(0.05)
+        self.fail("resume job did not reach an expected state")
+
+    def streak_attempts(self, state: Path, session_id: str = "session-failure-1") -> int:
+        with sqlite3.connect(str(state / "streaks.sqlite3")) as connection:
+            row = connection.execute(
+                "SELECT attempts FROM streaks WHERE scope_hash = ?",
+                (hashlib.sha256(f"failure:{session_id}".encode("utf-8")).hexdigest(),),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def read_events(self, state: Path, job_id: str) -> list[dict[str, object]]:
+        log = state / "logs" / f"{job_id}.jsonl"
+        return [
+            json.loads(line)
+            for line in log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def wait_for_calls(self, calls: Path, *, count: int = 1) -> list[list[str]]:
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            if calls.exists():
+                lines = [line for line in calls.read_text(encoding="utf-8").splitlines() if line.strip()]
+                if len(lines) >= count:
+                    return [json.loads(line) for line in lines]
+            time.sleep(0.05)
+        self.fail(f"fake codex did not record {count} call(s)")
+
     def run_failure(
         self,
         state: Path,
@@ -1364,19 +1506,12 @@ class FailureHookTests(unittest.TestCase):
     def test_retryable_failure_spawns_a_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            calls = root / "calls.jsonl"
-            fake = root / "codex"
-            fake.write_text(
-                "#!/usr/bin/env python3\n"
-                "import json, sys\n"
-                f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
-                encoding="utf-8",
-            )
-            fake.chmod(0o755)
+            calls = write_fake_codex(root)
             result = run_hook(
                 {
                     "hook_event_name": "PostModelRequest",
                     "session_id": "session-failure-1",
+                    "turn_id": "turn-failure-1",
                     "cwd": str(root),
                     "model": "test-model",
                     "status": "failed",
@@ -1386,25 +1521,37 @@ class FailureHookTests(unittest.TestCase):
                 env_updates={
                     "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
                     "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                    "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.05",
                 },
             )
-            for _ in range(100):
-                if calls.exists() and calls.read_text(encoding="utf-8").strip():
-                    break
-                time.sleep(0.05)
-            recorded = [
-                json.loads(line)
-                for line in calls.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            job_id, job_state, api_attempts, exit_code = self.wait_for_job(
+                root / "state",
+                detail_contains="pending later rollout reconciliation",
+            )
+            recorded = self.wait_for_calls(calls)
+            events = self.read_events(root / "state", job_id)
+            streak = self.streak_attempts(root / "state")
+            with sqlite3.connect(str(root / "state" / "streaks.sqlite3")) as connection:
+                verify_until, queued_detail = connection.execute(
+                    "SELECT verify_until, detail FROM resume_jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(recorded), 1)
         argv = recorded[0]
-        self.assertEqual(argv[:3], ["exec", "resume", "--skip-git-repo-check"])
+        self.assertEqual(argv[:4], ["queue", "--thread", "session-failure-1", "--message"])
+        self.assertEqual(argv[-1], "--resume")
+        self.assertTrue(argv[4].startswith("继续。"))
         self.assertIn("session-failure-1", argv)
-        self.assertTrue(argv[-1].startswith("继续。"))
-        self.assertIn("systemMessage", json.loads(result.stdout))
+        output = json.loads(result.stdout)
+        self.assertIn("systemMessage", output)
+        self.assertIn("已安排后台续跑", output["systemMessage"])
+        self.assertEqual((job_state, api_attempts, exit_code, streak), ("queued", 1, 0, 1))
+        self.assertEqual(events[-1]["event"], "queue_not_observed")
+        self.assertEqual(events[-1]["new_turn_seen"], False)
+        self.assertGreater(verify_until, int(time.time()))
+        self.assertIn("pending later rollout reconciliation", queued_detail)
 
     def test_non_retryable_failures_do_not_spawn(self) -> None:
         cases = {
@@ -1415,15 +1562,7 @@ class FailureHookTests(unittest.TestCase):
         for name, message in cases.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                calls = root / "calls.jsonl"
-                fake = root / "codex"
-                fake.write_text(
-                    "#!/usr/bin/env python3\n"
-                    "import json, sys\n"
-                    f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
-                    encoding="utf-8",
-                )
-                fake.chmod(0o755)
+                calls = write_fake_codex(root)
                 result = run_hook(
                     {
                         "hook_event_name": "PostModelRequest",
@@ -1454,24 +1593,18 @@ class FailureHookTests(unittest.TestCase):
     def test_the_same_failure_is_not_retried_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            calls = root / "calls.jsonl"
-            fake = root / "codex"
-            fake.write_text(
-                "#!/usr/bin/env python3\n"
-                "import json, sys\n"
-                f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
-                encoding="utf-8",
-            )
-            fake.chmod(0o755)
+            calls = write_fake_codex(root)
             env = {
                 "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
                 "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.1",
             }
             results = [
                 run_hook(
                     {
                         "hook_event_name": "PostModelRequest",
                         "session_id": "session-failure-1",
+                        "turn_id": "turn-failure-1",
                         "cwd": str(root),
                         "status": "failed",
                         "error": "exceeded retry limit, last status: 429 Too Many Requests",
@@ -1481,20 +1614,377 @@ class FailureHookTests(unittest.TestCase):
                 )
                 for _ in range(3)
             ]
-            for _ in range(100):
-                if calls.exists():
-                    break
-                time.sleep(0.05)
+            job_id, job_state, api_attempts, _ = self.wait_for_job(root / "state")
+            self.wait_for_calls(calls)
             time.sleep(0.2)
             lines = [
                 line
                 for line in calls.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ] if calls.exists() else []
+            streak = self.streak_attempts(root / "state")
 
         self.assertEqual([r.returncode for r in results], [0, 0, 0])
         self.assertEqual(len(lines), 1)
+        self.assertEqual((api_attempts, streak), (1, 1))
         self.assertEqual([r.stdout for r in results[1:]], ["", ""])
+
+    def test_different_errors_in_the_same_turn_create_only_one_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = write_fake_codex(root)
+            env = {
+                "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.05",
+            }
+            errors = [
+                "exceeded retry limit, last status: 429 Too Many Requests",
+                "stream disconnected before completion",
+            ]
+            for error in errors:
+                run_hook(
+                    {
+                        "hook_event_name": "PostModelRequest",
+                        "session_id": "session-failure-1",
+                        "turn_id": "turn-failure-1",
+                        "cwd": str(root),
+                        "status": "failed",
+                        "error": error,
+                    },
+                    root / "state",
+                    env_updates=env,
+                )
+            job_id, job_state, api_attempts, _ = self.wait_for_job(root / "state")
+            recorded = self.wait_for_calls(calls)
+            time.sleep(0.2)
+            with sqlite3.connect(str(root / "state" / "streaks.sqlite3")) as connection:
+                jobs = connection.execute("SELECT job_id FROM resume_jobs").fetchall()
+            streak = self.streak_attempts(root / "state")
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0][0], job_id)
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual((api_attempts, streak), (1, 1))
+        self.assertEqual(job_state, "queued")
+
+    def test_later_hook_reconciles_a_queued_job_to_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_started",
+                            "turn_id": "turn-failure-1",
+                        },
+                    }
+                ],
+            )
+            calls = write_fake_codex(root)
+            env = {
+                "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.05",
+            }
+            run_hook(
+                {
+                    "hook_event_name": "PostModelRequest",
+                    "session_id": "session-failure-1",
+                    "turn_id": "turn-failure-1",
+                    "transcript_path": str(transcript),
+                    "cwd": str(root),
+                    "status": "failed",
+                    "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                },
+                root / "state",
+                env_updates=env,
+            )
+            job_id, job_state, _, _ = self.wait_for_job(
+                root / "state",
+                states={"queued"},
+                detail_contains="pending later rollout reconciliation",
+            )
+            self.assertEqual(job_state, "queued")
+            append_task_started(transcript, "turn-after-queue")
+            # 任意后续 hook 都会先做 rollout 对账；用非可重试错误触发入口，
+            # 避免再建一个新 job。
+            reconcile = run_hook(
+                {
+                    "hook_event_name": "PostModelRequest",
+                    "session_id": "session-failure-1",
+                    "turn_id": "turn-failure-1",
+                    "transcript_path": str(transcript),
+                    "cwd": str(root),
+                    "status": "failed",
+                    "error": "401 Unauthorized",
+                },
+                root / "state",
+                env_updates=env,
+            )
+            with sqlite3.connect(str(root / "state" / "streaks.sqlite3")) as connection:
+                state, new_turn_seen = connection.execute(
+                    "SELECT state, new_turn_seen FROM resume_jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+            events = [
+                event
+                for event in self.read_events(root / "state", job_id)
+                if event["event"] == "job_reconciled"
+            ]
+
+        self.assertEqual(reconcile.returncode, 0, reconcile.stderr)
+        self.assertEqual((state, new_turn_seen), ("recovered", 1))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["state"], "recovered")
+
+    def test_queue_nonzero_unknown_outcome_does_not_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = write_fake_codex(
+                root,
+                queue_exit=1,
+                queue_message="network connection reset",
+            )
+            result = run_hook(
+                {
+                    "hook_event_name": "PostModelRequest",
+                    "session_id": "session-failure-1",
+                    "turn_id": "turn-failure-1",
+                    "cwd": str(root),
+                    "status": "failed",
+                    "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                },
+                root / "state",
+                env_updates={
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                    "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.05",
+                },
+            )
+            job_id, job_state, api_attempts, _ = self.wait_for_job(root / "state")
+            recorded = self.wait_for_calls(calls)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"]])
+        self.assertEqual((job_state, api_attempts), ("queued", 1))
+
+    def test_the_same_error_in_a_new_turn_creates_a_new_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = write_fake_codex(root)
+            env = {
+                "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.1",
+            }
+            for turn in ("turn-1", "turn-2"):
+                run_hook(
+                    {
+                        "hook_event_name": "PostModelRequest",
+                        "session_id": "session-failure-1",
+                        "turn_id": turn,
+                        "cwd": str(root),
+                        "status": "failed",
+                        "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                    },
+                    root / "state",
+                    env_updates=env,
+                )
+                self.wait_for_job(root / "state")
+            for _ in range(100):
+                if calls.exists() and len(calls.read_text(encoding="utf-8").splitlines()) >= 2:
+                    break
+                time.sleep(0.05)
+            connection = sqlite3.connect(str(root / "state" / "streaks.sqlite3"))
+            jobs = connection.execute("SELECT job_id FROM resume_jobs").fetchall()
+            connection.close()
+            recorded = calls.read_text(encoding="utf-8").splitlines()
+            streak = self.streak_attempts(root / "state")
+
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(len(recorded), 2)
+        self.assertEqual(streak, 2)
+
+    def test_a_writer_lock_that_never_clears_is_reported(self) -> None:
+        fcntl = __import__("fcntl")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = write_fake_codex(root, queue_exit=1, queue_message="unsupported queue")
+            home = root / "codex-home"
+            locks = home / "thread-writer-locks"
+            locks.mkdir(parents=True)
+            lock_path = locks / "session-failure-1.lock"
+            holder = lock_path.open("wb")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            try:
+                result = run_hook(
+                    {
+                        "hook_event_name": "PostModelRequest",
+                        "session_id": "session-failure-1",
+                        "turn_id": "turn-failure-1",
+                        "cwd": str(root),
+                        "status": "failed",
+                        "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                    },
+                    root / "state",
+                    env_updates={
+                        "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                        "CODEX_HOME": str(home),
+                        "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                        "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS": "0.4",
+                        "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS": "0.05",
+                    },
+                )
+                job_id, job_state, api_attempts, _ = self.wait_for_job(
+                    root / "state",
+                    states={"blocked_active_writer"},
+                )
+                events = self.read_events(root / "state", job_id)
+                recorded = self.wait_for_calls(calls)
+                streak = self.streak_attempts(root / "state")
+            finally:
+                holder.close()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"]])
+        self.assertEqual(job_state, "blocked_active_writer")
+        self.assertEqual((api_attempts, streak), (1, 1))
+        self.assertIn("lock_wait_timed_out", [event["event"] for event in events])
+
+    def test_resume_launch_failure_is_not_counted_as_an_api_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = run_hook(
+                {
+                    "hook_event_name": "PostModelRequest",
+                    "session_id": "session-failure-1",
+                    "turn_id": "turn-failure-1",
+                    "cwd": str(root),
+                    "status": "failed",
+                    "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                },
+                root / "state",
+                env_updates={
+                    "PATH": str(root / "empty-bin"),
+                    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                },
+            )
+            job_id, job_state, api_attempts, _ = self.wait_for_job(root / "state")
+            connection = sqlite3.connect(str(root / "state" / "streaks.sqlite3"))
+            connection.close()
+            streak = self.streak_attempts(root / "state")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(job_state, "failed_to_launch")
+        self.assertEqual((api_attempts, streak), (0, 0))
+        self.assertIn("后台续跑没有启动", json.loads(result.stdout)["systemMessage"])
+
+    def test_queue_acceptance_is_a_recovery_only_after_a_new_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            write_transcript(transcript, [])
+            calls = write_fake_codex(root, queue_append_task="turn-after-429")
+            result = run_hook(
+                {
+                    "hook_event_name": "PostModelRequest",
+                    "session_id": "session-failure-1",
+                    "turn_id": "turn-failure-1",
+                    "transcript_path": str(transcript),
+                    "cwd": str(root),
+                    "status": "failed",
+                    "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                },
+                root / "state",
+                env_updates={
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                    "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "1",
+                },
+            )
+            job_id, job_state, api_attempts, exit_code = self.wait_for_job(
+                root / "state",
+                states={"recovered"},
+            )
+            recorded = self.wait_for_calls(calls)
+            events = self.read_events(root / "state", job_id)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"]])
+        self.assertEqual((job_state, api_attempts, exit_code), ("recovered", 1, 0))
+        self.assertEqual(events[-1]["event"], "queue_recovered")
+
+    def test_queue_failure_falls_back_to_exec_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = write_fake_codex(
+                root,
+                queue_exit=1,
+                queue_message="unknown command queue",
+                exec_exit=0,
+            )
+            result = run_hook(
+                {
+                    "hook_event_name": "PostModelRequest",
+                    "session_id": "session-failure-1",
+                    "turn_id": "turn-failure-1",
+                    "cwd": str(root),
+                    "status": "failed",
+                    "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                },
+                root / "state",
+                env_updates={
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                    "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS": "0.1",
+                    "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS": "0.05",
+                },
+            )
+            job_id, job_state, api_attempts, exit_code = self.wait_for_job(
+                root / "state",
+                states={"completed_unverified"},
+            )
+            recorded = self.wait_for_calls(calls, count=2)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"], ["exec"]])
+        self.assertEqual(recorded[1][:2], ["exec", "resume"])
+        self.assertEqual((job_state, api_attempts, exit_code), ("completed_unverified", 1, 0))
+
+    def test_unknown_queue_outcome_does_not_dispatch_a_duplicate_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = write_fake_codex(root, queue_sleep=5)
+            result = run_hook(
+                {
+                    "hook_event_name": "PostModelRequest",
+                    "session_id": "session-failure-1",
+                    "turn_id": "turn-failure-1",
+                    "cwd": str(root),
+                    "status": "failed",
+                    "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                },
+                root / "state",
+                env_updates={
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                    "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS": "0.1",
+                    "DROID_AUTO_CONTINUE_QUEUE_TIMEOUT_SECONDS": "1",
+                },
+            )
+            job_id, job_state, api_attempts, _ = self.wait_for_job(root / "state")
+            recorded = self.wait_for_calls(calls)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"]])
+        # queue 超时说明消息可能已经写入；此时不能回退再发一次造成重复 turn，
+        # 也不能在验证窗口内直接判失败。
+        self.assertEqual(job_state, "queued")
+        self.assertEqual(api_attempts, 1)
 
 
 class DroidFailureStopTests(unittest.TestCase):
@@ -1732,20 +2222,33 @@ class DroidFailureStopTests(unittest.TestCase):
 
 
 class ResumeHelperTests(unittest.TestCase):
-    """后台辅助进程：先退避、等写锁释放，再续跑。"""
+    """后台辅助进程：先退避，优先 queue，失败再等写锁后 exec。"""
 
     def run_helper(
         self,
         *args: str,
+        mode: str = "--resume-after-lock",
         env_updates: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         for name in ENV_VARS:
             env.pop(name, None)
-        if env_updates:
-            env.update(env_updates)
+        if not env_updates or "DROID_AUTO_CONTINUE_STATE_DIR" not in env_updates:
+            with tempfile.TemporaryDirectory() as tmp:
+                env["DROID_AUTO_CONTINUE_STATE_DIR"] = str(Path(tmp) / "state")
+                if env_updates:
+                    env.update(env_updates)
+                return subprocess.run(
+                    [sys.executable, str(SCRIPT), mode, *args],
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    env=env,
+                    timeout=120,
+                )
+        env.update(env_updates)
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--resume-after-lock", *args],
+            [sys.executable, str(SCRIPT), mode, *args],
             text=True,
             encoding="utf-8",
             capture_output=True,
@@ -1753,18 +2256,37 @@ class ResumeHelperTests(unittest.TestCase):
             timeout=120,
         )
 
+    def test_resume_job_argument_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fake_codex(root)
+            overrides = ["-c", "model_provider=fake"]
+            result = self.run_helper(
+                "job-123",
+                "session-map-1",
+                str(root),
+                "0",
+                json.dumps(overrides),
+                str(root / "rollout.jsonl"),
+                "turn-map-1",
+                mode="--resume-job",
+                env_updates={
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "DROID_AUTO_CONTINUE_STATE_DIR": str(root / "state"),
+                    "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.1",
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_helper_resumes_once_the_lock_is_free(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            calls = root / "calls.jsonl"
-            fake = root / "codex"
-            fake.write_text(
-                "#!/usr/bin/env python3\n"
-                "import json, sys\n"
-                f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
-                encoding="utf-8",
+            calls = write_fake_codex(
+                root,
+                queue_exit=1,
+                queue_message="unknown subcommand: queue",
             )
-            fake.chmod(0o755)
             home = root / "codex-home"
             (home / "thread-writer-locks").mkdir(parents=True)
             result = self.run_helper(
@@ -1777,6 +2299,8 @@ class ResumeHelperTests(unittest.TestCase):
                 env_updates={
                     "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
                     "CODEX_HOME": str(home),
+                    "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS": "0.1",
+                    "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS": "0.05",
                 },
             )
             recorded = [
@@ -1786,28 +2310,58 @@ class ResumeHelperTests(unittest.TestCase):
             ]
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(recorded), 1)
-        self.assertEqual(recorded[0][:2], ["exec", "resume"])
-        self.assertIn("--skip-git-repo-check", recorded[0])
-        self.assertIn("session-helper-1", recorded[0])
-        # hook 进程算好的覆盖必须原样带到续跑命令里。
-        self.assertIn("model_provider=fake", recorded[0])
-        self.assertIn('sandbox_mode="danger-full-access"', recorded[0])
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"], ["exec"]])
+        self.assertEqual(recorded[1][:2], ["exec", "resume"])
+        self.assertIn("--skip-git-repo-check", recorded[1])
+        self.assertIn("session-helper-1", recorded[1])
+        # queue 不可用时，hook 进程算好的覆盖必须原样带到 exec resume。
+        self.assertIn("model_provider=fake", recorded[1])
+        self.assertIn('sandbox_mode="danger-full-access"', recorded[1])
 
-    def test_helper_waits_while_the_writer_lock_is_held(self) -> None:
-        """锁被占用时不能直接续跑，必须等到释放。"""
+    def test_helper_queues_without_waiting_for_the_writer_lock(self) -> None:
         fcntl = __import__("fcntl")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            calls = root / "calls.jsonl"
-            fake = root / "codex"
-            fake.write_text(
-                "#!/usr/bin/env python3\n"
-                "import json, sys\n"
-                f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + chr(10))\n",
-                encoding="utf-8",
+            calls = write_fake_codex(root)
+            home = root / "codex-home"
+            locks = home / "thread-writer-locks"
+            locks.mkdir(parents=True)
+            lock_path = locks / "session-helper-queue.lock"
+            holder = lock_path.open("wb")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            try:
+                result = self.run_helper(
+                    "session-helper-queue",
+                    str(root),
+                    "0",
+                    "[]",
+                    env_updates={
+                        "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                        "CODEX_HOME": str(home),
+                        "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.1",
+                    },
+                )
+                recorded = [
+                    json.loads(line)
+                    for line in calls.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            finally:
+                holder.close()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"]])
+
+    def test_helper_waits_while_the_writer_lock_is_held(self) -> None:
+        """queue 不可用时，锁被占用必须等释放，不能提前 exec。"""
+        fcntl = __import__("fcntl")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = write_fake_codex(
+                root,
+                queue_exit=1,
+                queue_message="unknown subcommand: queue",
             )
-            fake.chmod(0o755)
             home = root / "codex-home"
             locks = home / "thread-writer-locks"
             locks.mkdir(parents=True)
@@ -1833,12 +2387,19 @@ class ResumeHelperTests(unittest.TestCase):
                     **os.environ,
                     "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
                     "CODEX_HOME": str(home),
+                    "DROID_AUTO_CONTINUE_STATE_DIR": str(root / "state"),
+                    "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS": "30",
+                    "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS": "0.05",
                 },
             )
             try:
-                # 锁还握着的时候不能有续跑。
-                time.sleep(2.5)
-                self.assertFalse(calls.exists(), "helper resumed while the lock was held")
+                time.sleep(1.5)
+                during = [
+                    json.loads(line)
+                    for line in calls.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual([argv[:1] for argv in during], [["queue"]])
                 fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
                 holder.close()
                 proc.communicate(timeout=60)
@@ -1855,8 +2416,397 @@ class ResumeHelperTests(unittest.TestCase):
                 if line.strip()
             ]
 
-        self.assertEqual(len(recorded), 1)
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"], ["exec"]])
 
+    def test_resume_job_records_recovery_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            write_transcript(transcript, [])
+            calls = write_fake_codex(
+                root,
+                queue_exit=1,
+                queue_message="unsupported queue",
+                exec_append_task="turn-exec-new",
+            )
+            overrides = json.dumps([])
+            recovered = self.run_helper(
+                "job-recovered",
+                "session-helper-recovered",
+                str(root),
+                "0",
+                overrides,
+                str(transcript),
+                "turn-failure",
+                mode="--resume-job",
+                env_updates={
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "DROID_AUTO_CONTINUE_STATE_DIR": str(root / "state"),
+                    "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.1",
+                    "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS": "0.1",
+                },
+            )
+            with sqlite3.connect(str(root / "state" / "streaks.sqlite3")) as connection:
+                recovered_state = connection.execute(
+                    "SELECT state, new_turn_seen FROM resume_jobs WHERE job_id = ?",
+                    ("job-recovered",),
+                ).fetchone()
+
+            failed_root = root / "failed"
+            failed_root.mkdir()
+            write_transcript(failed_root / "rollout.jsonl", [])
+            write_fake_codex(
+                failed_root,
+                queue_exit=1,
+                queue_message="unsupported queue",
+                exec_exit=7,
+                exec_message="provider unavailable",
+            )
+            failed = self.run_helper(
+                "job-failed",
+                "session-helper-failed",
+                str(failed_root),
+                "0",
+                overrides,
+                str(failed_root / "rollout.jsonl"),
+                "turn-failure",
+                mode="--resume-job",
+                env_updates={
+                    "PATH": f"{failed_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "DROID_AUTO_CONTINUE_STATE_DIR": str(root / "state"),
+                    "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.1",
+                    "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS": "0.1",
+                },
+            )
+            with sqlite3.connect(str(root / "state" / "streaks.sqlite3")) as connection:
+                failed_state = connection.execute(
+                    "SELECT state, exit_code, detail FROM resume_jobs WHERE job_id = ?",
+                    ("job-failed",),
+                ).fetchone()
+            failed_events = [
+                json.loads(line)
+                for line in (root / "state" / "logs" / "job-failed.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            recovered_calls = [
+                json.loads(line)
+                for line in calls.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(failed.returncode, 0, failed.stderr)
+        self.assertEqual(recovered_state, ("recovered", 1))
+        self.assertEqual([argv[:1] for argv in recovered_calls], [["queue"], ["exec"]])
+        self.assertEqual(failed_state[0:2], ("failed", 7))
+        self.assertIn("provider unavailable", failed_state[2])
+        self.assertIn("provider unavailable", json.dumps(failed_events))
+
+    def test_new_turn_during_lock_wait_avoids_exec(self) -> None:
+        fcntl = __import__("fcntl")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            write_transcript(
+                transcript,
+                [{"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-failure"}}],
+            )
+            calls = write_fake_codex(
+                root,
+                queue_exit=1,
+                queue_message="unsupported queue",
+            )
+            home = root / "codex-home"
+            locks = home / "thread-writer-locks"
+            locks.mkdir(parents=True)
+            holder = (locks / "session-helper-superseded.lock").open("wb")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--resume-job",
+                    "job-superseded",
+                    "session-helper-superseded",
+                    str(root),
+                    "0",
+                    "[]",
+                    str(transcript),
+                    "turn-failure",
+                ],
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "CODEX_HOME": str(home),
+                    "DROID_AUTO_CONTINUE_STATE_DIR": str(root / "state"),
+                    "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS": "30",
+                    "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS": "0.05",
+                },
+            )
+            try:
+                time.sleep(1)
+                append_task_started(transcript, "turn-new-before-exec")
+                proc.communicate(timeout=30)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+                holder.close()
+
+            with sqlite3.connect(str(root / "state" / "streaks.sqlite3")) as connection:
+                job_state = connection.execute(
+                    "SELECT state FROM resume_jobs WHERE job_id = ?",
+                    ("job-superseded",),
+                ).fetchone()[0]
+            recorded = [
+                json.loads(line)
+                for line in calls.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(job_state, "superseded")
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"]])
+
+    def test_helper_records_an_active_writer_timeout(self) -> None:
+        fcntl = __import__("fcntl")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = write_fake_codex(root, queue_exit=1, queue_message="unsupported queue")
+            home = root / "codex-home"
+            locks = home / "thread-writer-locks"
+            locks.mkdir(parents=True)
+            holder = (locks / "session-helper-blocked.lock").open("wb")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            try:
+                result = self.run_helper(
+                    "job-blocked",
+                    "session-helper-blocked",
+                    str(root),
+                    "0",
+                    "[]",
+                    "",
+                    "turn-failure",
+                    mode="--resume-job",
+                    env_updates={
+                        "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                        "CODEX_HOME": str(home),
+                        "DROID_AUTO_CONTINUE_STATE_DIR": str(root / "state"),
+                        "DROID_AUTO_CONTINUE_LOCK_WAIT_SECONDS": "0.1",
+                        "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS": "0.05",
+                    },
+                )
+                with sqlite3.connect(str(root / "state" / "streaks.sqlite3")) as connection:
+                    job_state = connection.execute(
+                        "SELECT state FROM resume_jobs WHERE job_id = ?",
+                        ("job-blocked",),
+                    ).fetchone()[0]
+                recorded = [
+                    json.loads(line)
+                    for line in calls.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            finally:
+                holder.close()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(job_state, "blocked_active_writer")
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"]])
+
+
+class ResumeJobMigrationTests(unittest.TestCase):
+    """升级 0.5.0 不能因为旧 CHECK 拒绝 queued 而丢失恢复闭环。"""
+
+    @staticmethod
+    def create_legacy_database(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE streaks (
+                    scope_hash TEXT PRIMARY KEY,
+                    attempts INTEGER NOT NULL CHECK(
+                        attempts >= 0 AND attempts <= 10
+                    ),
+                    assistant_hash TEXT,
+                    last_seen INTEGER NOT NULL CHECK(last_seen >= 0),
+                    progress TEXT
+                );
+                CREATE TABLE resume_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    scope_hash TEXT NOT NULL,
+                    session_hash TEXT NOT NULL,
+                    turn_hash TEXT NOT NULL,
+                    error_hash TEXT NOT NULL,
+                    transcript_offset INTEGER NOT NULL DEFAULT 0 CHECK(transcript_offset >= 0),
+                    baseline_at INTEGER NOT NULL DEFAULT 0 CHECK(baseline_at >= 0),
+                    state TEXT NOT NULL CHECK(
+                        state IN (
+                            'blocked_active_writer',
+                            'completed_unverified',
+                            'dispatching',
+                            'failed',
+                            'failed_to_launch',
+                            'recovered',
+                            'scheduled',
+                            'superseded',
+                            'waiting_lock'
+                        )
+                    ),
+                    dispatch_attempts INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_attempts >= 0),
+                    resume_pid INTEGER,
+                    exit_code INTEGER,
+                    new_turn_seen INTEGER CHECK(new_turn_seen IN (0, 1)),
+                    detail TEXT,
+                    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+                    api_attempts INTEGER NOT NULL DEFAULT 0,
+                    transcript_path TEXT,
+                    turn_id TEXT,
+                    verify_until INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX resume_jobs_scope_created
+                    ON resume_jobs(scope_hash, created_at);
+                INSERT INTO resume_jobs (
+                    job_id, scope_hash, session_hash, turn_hash, error_hash,
+                    state, created_at, updated_at, detail
+                ) VALUES (
+                    'legacy-waiting', 'scope-a', 'session-a', 'turn-a', 'error-a',
+                    'waiting_lock', 100, 100, 'old helper waited for the writer lock'
+                );
+                INSERT INTO resume_jobs (
+                    job_id, scope_hash, session_hash, turn_hash, error_hash,
+                    state, created_at, updated_at, detail
+                ) VALUES (
+                    'legacy-scheduled', 'scope-b', 'session-b', 'turn-b', 'error-b',
+                    'scheduled', 101, 101, 'old helper was scheduled'
+                );
+                """
+            )
+
+    def load_module(self):
+        spec = importlib.util.spec_from_file_location("ac_migration", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_upgrade_rebuilds_the_old_check_and_preserves_every_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            self.create_legacy_database(state / "streaks.sqlite3")
+            env = {
+                "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "DROID_AUTO_CONTINUE_STATE_DIR": str(state),
+            }
+            module = self.load_module()
+            old_env = os.environ.copy()
+            os.environ.update(env)
+            try:
+                connection = module.connect()
+                create_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resume_jobs'"
+                ).fetchone()[0]
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(resume_jobs)")
+                }
+                legacy_rows = connection.execute(
+                    "SELECT job_id, state, detail FROM resume_jobs ORDER BY job_id"
+                ).fetchall()
+                indexes = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'resume_jobs'"
+                    )
+                }
+                connection.execute(
+                    "UPDATE resume_jobs SET state = 'queued', verify_until = ? WHERE job_id = ?",
+                    (int(time.time()) + 60, "legacy-waiting"),
+                )
+                queued_state = connection.execute(
+                    "SELECT state FROM resume_jobs WHERE job_id = 'legacy-waiting'"
+                ).fetchone()[0]
+                connection.commit()
+                connection.close()
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+
+            calls = write_fake_codex(root)
+            result = run_hook(
+                {
+                    "hook_event_name": "PostModelRequest",
+                    "session_id": "session-migration-1",
+                    "turn_id": "turn-migration-1",
+                    "cwd": str(root),
+                    "status": "failed",
+                    "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                },
+                state,
+                env_updates={
+                    "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                    "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.05",
+                },
+            )
+            # Wait for the newly created fake-queue job to finish verification.
+            deadline = time.monotonic() + 8
+            new_job = None
+            while time.monotonic() < deadline:
+                with sqlite3.connect(str(state / "streaks.sqlite3")) as connection:
+                    new_job = connection.execute(
+                        "SELECT job_id, state FROM resume_jobs "
+                        "WHERE job_id NOT IN ('legacy-waiting', 'legacy-scheduled') "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ).fetchone()
+                if new_job is not None and new_job[1] == "queued":
+                    break
+                time.sleep(0.05)
+            with sqlite3.connect(str(state / "streaks.sqlite3")) as connection:
+                records = connection.execute(
+                    "SELECT job_id, state FROM resume_jobs ORDER BY job_id"
+                ).fetchall()
+                final_index = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'resume_jobs'"
+                    )
+                }
+            call_deadline = time.monotonic() + 8
+            recorded_calls: list[list[str]] = []
+            while time.monotonic() < call_deadline:
+                if calls.exists():
+                    recorded_calls = [
+                        json.loads(line)
+                        for line in calls.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ]
+                    if recorded_calls:
+                        break
+                time.sleep(0.05)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("'queued'", create_sql)
+        self.assertTrue({"verify_until", "api_attempts", "transcript_path", "turn_id"} <= columns)
+        self.assertEqual(
+            legacy_rows,
+            [
+                ("legacy-scheduled", "scheduled", "old helper was scheduled"),
+                ("legacy-waiting", "waiting_lock", "old helper waited for the writer lock"),
+            ],
+        )
+        self.assertIn("resume_jobs_scope_created", indexes)
+        self.assertIn("resume_jobs_scope_created", final_index)
+        self.assertEqual(queued_state, "queued")
+        self.assertEqual(new_job[1], "queued")
+        self.assertEqual([argv[:1] for argv in recorded_calls], [["queue"]])
+        self.assertEqual(len(records), 3)
 
 class ProcessArgvTests(unittest.TestCase):
     """续跑要还原原进程命令行，必须精确拿到 argv。"""
