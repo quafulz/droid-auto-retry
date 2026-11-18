@@ -193,6 +193,10 @@ ENDING_API = "api"
 ENDING_TOOL_USE = "tool_use"
 ENDING_UNKNOWN = "unknown"
 ENDING_COMPLETE = "complete"
+# 模型按 Droid 的提醒空回复，或停下来等后台任务。不是流中断，也不当正常答复播报。
+ENDING_IDLE = "idle"
+EMPTY_END_INSTRUCTION = "end the turn by replying with no text and no tool calls"
+MAX_BACKGROUND_WAIT_CHARS = 4000
 
 CONTINUATION_REASON = "继续。上一轮在思考阶段中断，没有输出正文，也没有发出工具调用。"
 CONTINUATION_REASONS = {
@@ -700,6 +704,102 @@ def classify_text(
     return ENDING_COMPLETE, ""
 
 
+def joined_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+        nested = joined_text(item.get("content"))
+        if nested:
+            parts.append(nested)
+    return "\n".join(part for part in parts if part)
+
+
+def blocks_of_type(message: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        block for block in content if isinstance(block, dict) and block.get("type") == kind
+    ]
+
+
+def user_record_before_last_assistant(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """最后一条助手消息紧前面的用户消息。中间的非 message 记录跳过。"""
+    seen_assistant = False
+    for record in reversed(records):
+        if record.get("type") != "message":
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            return None
+        if not seen_assistant:
+            if message.get("role") != "assistant":
+                return None
+            seen_assistant = True
+            continue
+        if message.get("role") == "user":
+            return record
+        return None
+    return None
+
+
+def reminded_to_end_without_output(record: dict[str, Any], message: dict[str, Any]) -> bool:
+    """Droid 在待办还开着时会要求：没有可做的事，就用空回复结束。"""
+    parts: list[str] = []
+    for block in blocks_of_type(message, "text"):
+        text = block.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    blob = "\n".join(parts)
+    if EMPTY_END_INSTRUCTION not in blob:
+        return False
+    if message.get("visibility") == "llm_only":
+        return True
+    record_id = record.get("id")
+    return isinstance(record_id, str) and record_id.startswith("__internal__system-reminder__")
+
+
+def waiting_on_background_task(message: dict[str, Any]) -> bool:
+    """TaskOutput 仍在跑，或任务启动时已经写明不要轮询。"""
+    parts: list[str] = []
+    for block in blocks_of_type(message, "tool_result"):
+        text = block.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+        parts.append(joined_text(block.get("content")))
+    blob = "\n".join(part for part in parts if part)
+    if not blob or len(blob) > MAX_BACKGROUND_WAIT_CHARS:
+        return False
+    if "Status: running" in blob and "Task is still running" in blob:
+        return True
+    return "do not wait for it or poll for it with TaskOutput" in blob
+
+
+def is_deliberate_empty_stop(records: list[dict[str, Any]]) -> bool:
+    """空回复是模型在收尾或在等通知，不是采样被掐断。"""
+    record = user_record_before_last_assistant(records)
+    if record is None:
+        return False
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return False
+    if reminded_to_end_without_output(record, message):
+        return True
+    return waiting_on_background_task(message)
+
+
 def classify_ending(
     records: list[dict[str, Any]],
     message: dict[str, Any],
@@ -710,6 +810,8 @@ def classify_ending(
     if assistant_has_tool_use(message):
         return ENDING_TOOL_USE, ""
     if assistant_is_silent(message):
+        if is_deliberate_empty_stop(records):
+            return ENDING_IDLE, ""
         return ENDING_SILENT, ""
     if assistant_has_unknown_block(message):
         return ENDING_UNKNOWN, ""
@@ -3297,7 +3399,7 @@ def finish_classified(
     announce_complete: bool,
     todo_tool: str,
 ) -> int:
-    if kind in {ENDING_TOOL_USE, ENDING_UNKNOWN}:
+    if kind in {ENDING_TOOL_USE, ENDING_UNKNOWN, ENDING_IDLE}:
         return 0
     if kind == ENDING_COMPLETE:
         if announce_complete:

@@ -9,6 +9,7 @@ Factory Droid 和 Codex 插件。Custom Model 的回合没有真正做完就停�
 看当前会话 transcript 里最后一条 assistant 消息，以及它之前的待办状态：
 
 - 只有 `thinking` / `reasoning`，或者正文是空白：续跑。TUI 会多一条系统消息，形如 `Hook message: APUS Private DS v4.1 Flash #2 发生中断，正在自动重试 1/4...`。`Hook message:` 是 Droid 加的前缀。模型名优先用这条 assistant 消息的 `modelId` 在 Custom Model 设置里对应的 displayName；对不上时从 id 里取出 `custom:<名字>-<序号>` 的名字。没有模型 id 时显示 `Custom Model`。
+- 两种空回复不续跑，也不打印「本轮任务正常完成。」：上一条是只给模型看的系统提醒，写明没有可做的事时用无正文、无工具调用结束回合；或者上一条是短的工具结果，写明后台任务仍在运行（`Status: running` 且 `Task is still running`），或任务启动时写明不要用 `TaskOutput` 轮询。用户自己把这些句子贴进对话，或普通工具结果后面只剩思考，仍按中断续跑。
 - 正文是上下文压缩摘要：续跑。自动压缩时模型会输出 `<analysis>...</analysis><summary>...</summary>`，这类消息只是摘要，不是给用户的答复。细分场景下系统消息是 `... 任务尚未完成，正在自动续跑 1/4...`。
 - 正文被截断：代码块 ` ``` ` 未闭合，或 `<analysis>` / `<summary>` 有开无闭：续跑。
 - 正文以工具调用协议片段收尾：续跑。Custom Model 偶尔把 `<｜DSML｜ ...>`、`<antml:...>` 这类片段当成正文输出，回合就此结束，工具并没有真的调用。只认落在正文末尾的标记，正文中间引用、或整段写在代码块里讨论都不会命中。

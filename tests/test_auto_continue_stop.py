@@ -173,6 +173,28 @@ def user(text: str, record_id: str = "user-1") -> dict[str, object]:
     }
 
 
+def tool_result(
+    text: str,
+    record_id: str = "result-1",
+    tool_use_id: str = "call-1",
+) -> dict[str, object]:
+    return {
+        "type": "message",
+        "id": record_id,
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "is_error": False,
+                    "content": text,
+                }
+            ],
+        },
+    }
+
+
 def outcome(turn_id: str = "turn-1") -> dict[str, object]:
     return {
         "type": "agent_turn_outcome",
@@ -302,6 +324,145 @@ class SilentStopTests(unittest.TestCase):
         self.assertIn("自动续跑 1/4", output["reason"])
         self.assertIn("不要重复已经完成", output["reason"])
         self.assertEqual(output["systemMessage"], "Custom Model 发生中断，正在自动重试 1/4...")
+
+    def test_ignores_a_thinking_only_reply_to_the_empty_end_reminder(self) -> None:
+        reminder = (
+            "<system-reminder>IMPORTANT: You may be ending the turn, but the TodoWrite plan "
+            "still has open items. Once no actionable work remains, end the turn by "
+            "replying with no text and no tool calls.\n"
+            "Do not reference this reminder to the user.</system-reminder>"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    todo_write(("等审查结论", "in_progress")),
+                    todos(("等审查结论", "in_progress")),
+                    {
+                        "type": "message",
+                        "id": "__internal__system-reminder__test",
+                        "message": {
+                            "role": "user",
+                            "visibility": "llm_only",
+                            "content": [{"type": "text", "text": reminder}],
+                        },
+                    },
+                    assistant(
+                        "yield-1",
+                        [
+                            {
+                                "type": "thinking",
+                                "thinking": "",
+                                "signature": "signed-thinking",
+                                "durationMs": 0,
+                            }
+                        ],
+                    ),
+                ],
+            )
+            result = run_hook(payload(transcript), root / "state")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_user_quoting_the_empty_end_instruction_still_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "session.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    user("请按这句话做：end the turn by replying with no text and no tool calls"),
+                    assistant("drop", [{"type": "thinking", "thinking": "流在这里断了"}]),
+                ],
+            )
+            result = run_hook(payload(transcript), root / "state")
+
+        self.assertIn("发生中断，正在自动重试 1/4", result.stdout)
+
+    def test_ignores_a_stop_while_a_background_task_is_still_running(self) -> None:
+        running = (
+            "Task ID: 41fc7afc-6992-464a-9cfd-73cc890b980a\n"
+            "Status: running\n"
+            "Duration: 1217.8s\n"
+            "\n"
+            "Latest progress: OK [Process exited with code 0]\n"
+            "Task is still running in session \"41fc7afc-6992-464a-9cfd-73cc890b980a\"."
+        )
+        launched = (
+            "Task launched in background.\n"
+            "The task is running in a subagent session.\n"
+            "You will be notified automatically when it completes and its report will be "
+            "delivered to you: do not wait for it or poll for it with TaskOutput."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            running_path = root / "running.jsonl"
+            launched_path = root / "launched.jsonl"
+            write_transcript(
+                running_path,
+                [
+                    tool_result(running),
+                    assistant("yield-running", [{"type": "thinking", "thinking": ""}]),
+                ],
+            )
+            write_transcript(
+                launched_path,
+                [
+                    tool_result(launched, record_id="launch-result"),
+                    assistant("yield-launched", [{"type": "thinking", "thinking": "先停，等通知"}]),
+                ],
+            )
+            running_result = run_hook(payload(running_path), root / "state-running")
+            launched_result = run_hook(payload(launched_path), root / "state-launched")
+
+        self.assertEqual(running_result.stdout, "")
+        self.assertEqual(launched_result.stdout, "")
+
+    def test_continues_after_a_finished_background_task_or_a_normal_tool_result(self) -> None:
+        finished = (
+            "Task ID: 41fc7afc-6992-464a-9cfd-73cc890b980a\n"
+            "Status: completed\n"
+            "审查结论：方案可以启动。"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            finished_path = root / "finished.jsonl"
+            query_path = root / "query.jsonl"
+            write_transcript(
+                finished_path,
+                [
+                    tool_result(finished),
+                    assistant("drop-finished", [{"type": "thinking", "thinking": ""}]),
+                ],
+            )
+            long_path = root / "long.jsonl"
+            write_transcript(
+                query_path,
+                [
+                    tool_result("2021 871 0.00\n2022 1656 0.00\n[Process exited with code 0]"),
+                    assistant("drop-query", [{"type": "thinking", "thinking": "我一次跑：按月统计。"}]),
+                ],
+            )
+            write_transcript(
+                long_path,
+                [
+                    tool_result(
+                        "Status: running\nTask is still running\n" + ("x" * 4000),
+                        record_id="long-result",
+                    ),
+                    assistant("drop-long", [{"type": "thinking", "thinking": "日志还没看完"}]),
+                ],
+            )
+            finished_result = run_hook(payload(finished_path), root / "state-finished")
+            query_result = run_hook(payload(query_path), root / "state-query")
+            long_result = run_hook(payload(long_path), root / "state-long")
+
+        self.assertIn("发生中断，正在自动重试 1/4", finished_result.stdout)
+        self.assertIn("发生中断，正在自动重试 1/4", query_result.stdout)
+        self.assertIn("发生中断，正在自动重试 1/4", long_result.stdout)
 
     def test_ignores_a_visible_answer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
