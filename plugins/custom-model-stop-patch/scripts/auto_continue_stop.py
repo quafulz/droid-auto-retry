@@ -198,22 +198,24 @@ ENDING_UNKNOWN = "unknown"
 ENDING_COMPLETE = "complete"
 # 模型按 Droid 的提醒空回复，或停下来等后台任务。不是流中断，也不当正常答复播报。
 ENDING_IDLE = "idle"
+# 这条提醒的记录 id 是 __internal__system-reminder__<uuid>，和媒体上限、重复调用、
+# 输出被截断等提醒共用同一个形状，正文里的这句指令是唯一能分开的标记。
 EMPTY_END_INSTRUCTION = "end the turn by replying with no text and no tool calls"
 MAX_BACKGROUND_WAIT_CHARS = 4000
-BACKGROUND_HEAD_CHARS = 500
-BACKGROUND_WAIT_PHRASE = "do not wait for it or poll for it with TaskOutput"
-TASK_ID_RE = re.compile(
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-    re.IGNORECASE,
-)
+HEADER_LINE_LIMIT = 12
+UUID_TOKEN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+LABELED_TASK_ID = re.compile(rf"^task_id:\s*({UUID_TOKEN})\s*$", re.IGNORECASE)
+POLL_TASK_ID = re.compile(rf"^Task ID:\s*({UUID_TOKEN})\s*$", re.IGNORECASE)
+SUBAGENT_TYPE_LINE = re.compile(r"^subagent_type:\s*\S", re.IGNORECASE)
+STATUS_LINE = re.compile(r"^Status:\s*([A-Za-z]+)\s*$")
 CHILD_SESSION_RE = re.compile(
-    r"child session:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    rf"child session:\s*({UUID_TOKEN})",
     re.IGNORECASE,
 )
-COMPACTED_SUBAGENT_HEADER = (
-    "Subagents that were still running when this conversation was compacted:"
-)
-COMPACTED_SUBAGENT_NOTE = "do not poll, wake, cancel, or resume them based on this list."
+# 子代理结束通知。id 是这个前缀加上另一枚 uuid，任务 id 在正文的 task_id 字段。
+TASK_COMPLETION_PREFIX = "task-completion:"
+# 压缩后仍在跑的子代理。id 里带这个标记，child session 才是任务 id，invocation 不是。
+ACTIVE_SUBAGENTS_ID = "__internal__system-reminder__active-subagents__"
 # Droid 在命令结束时另写一条记录，id 是这个前缀加上当初的工具调用 id。
 EXECUTE_COMPLETION_PREFIX = "execute-completion:"
 
@@ -808,28 +810,55 @@ def tool_result_blob(message: dict[str, Any]) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def background_wait_blob(blob: str) -> bool:
-    """短工具结果里的等待标记。超长结果弃权，避免大段日志碰巧带上同样的句子。"""
-    if not blob or len(blob) > MAX_BACKGROUND_WAIT_CHARS:
-        return False
-    if "Status: running" in blob and "Task is still running" in blob:
-        return True
-    return BACKGROUND_WAIT_PHRASE in blob
+def header_lines(text: str) -> list[str]:
+    """工具结果和结束通知开头的字段行。交付正文从 output / Latest progress 起不再看。"""
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("output:", "failure:", "Latest progress:")):
+            break
+        lines.append(stripped)
+        if len(lines) >= HEADER_LINE_LIMIT:
+            break
+    return lines
 
 
-def background_done_blob(blob: str) -> bool:
-    """完成标记看开头。交付正文可以很长，状态行仍在前面。"""
+def tool_result_task_update(blob: str) -> tuple[str, set[str]] | None:
+    """从工具结果开头的字段判断后台任务是刚启动、仍在跑，还是已经结束。
+
+    启动回执同时有 `task_id` 和 `subagent_type`。进度结果同时有 `Task ID`
+    和单独成行的 `Status`。`running` 算还在跑，其它状态词算结束。
+    只看开头几行，交付正文里出现同样的行不算。
+    """
     if not blob:
-        return False
-    return "Status: completed" in blob[:BACKGROUND_HEAD_CHARS]
-
-
-def background_task_ids(blob: str) -> set[str]:
-    found = {
-        match.group(0).lower()
-        for match in TASK_ID_RE.finditer(blob[:BACKGROUND_HEAD_CHARS])
-    }
-    return found or {"*"}
+        return None
+    launch_ids: set[str] = set()
+    poll_ids: set[str] = set()
+    saw_subagent = False
+    status: str | None = None
+    for line in header_lines(blob):
+        match = LABELED_TASK_ID.match(line)
+        if match:
+            launch_ids.add(match.group(1).lower())
+            continue
+        if SUBAGENT_TYPE_LINE.match(line):
+            saw_subagent = True
+            continue
+        match = POLL_TASK_ID.match(line)
+        if match:
+            poll_ids.add(match.group(1).lower())
+            continue
+        match = STATUS_LINE.match(line)
+        if match and status is None:
+            status = match.group(1)
+    if poll_ids and status is not None:
+        kind = "wait" if status == "running" else "done"
+        return kind, poll_ids
+    if launch_ids and saw_subagent:
+        return "wait", launch_ids
+    return None
 
 
 def message_text(message: dict[str, Any]) -> str:
@@ -914,44 +943,47 @@ def fire_and_forget_call_ids(message: dict[str, Any]) -> list[str]:
     return found
 
 
-def compacted_task_ids(text: str) -> set[str]:
-    """压缩提醒里仍在跑的子代理。只取 child session，不取 invocation。"""
+def task_completion_id(record: dict[str, Any]) -> str:
+    """记录 id 为 task-completion:<uuid> 时，返回开头的 task_id。
+
+    实测 reason 有 completed、cancelled、error、process_exit，以及供应商失败。
+    这些都表示任务已经不在跑，所以不看首行英文，也不筛 reason 的具体取值。
+    """
+    record_id = record.get("id")
+    if not isinstance(record_id, str) or not record_id.startswith(TASK_COMPLETION_PREFIX):
+        return ""
+    if not is_llm_only_message(record):
+        return ""
+    for line in header_lines(record_notice_text(record)):
+        match = LABELED_TASK_ID.match(line)
+        if match:
+            return match.group(1).lower()
+    return ""
+
+
+def active_subagent_ids(record: dict[str, Any]) -> set[str]:
+    """压缩提醒的记录 id 带 active-subagents 时，取出仍在跑的 child session。"""
+    record_id = record.get("id")
+    if not isinstance(record_id, str) or ACTIVE_SUBAGENTS_ID not in record_id:
+        return set()
+    if not is_llm_only_message(record):
+        return set()
+    text = record_notice_text(record)
     if len(text) > MAX_BACKGROUND_WAIT_CHARS:
         return set()
-    if COMPACTED_SUBAGENT_HEADER not in text or COMPACTED_SUBAGENT_NOTE not in text:
-        return set()
     return {match.group(1).lower() for match in CHILD_SESSION_RE.finditer(text)}
-
-
-def named_task_ids(text: str) -> set[str]:
-    return {
-        match.group(0).lower()
-        for match in TASK_ID_RE.finditer(text[:BACKGROUND_HEAD_CHARS])
-    }
-
-
-def is_background_completion_notice(record: dict[str, Any]) -> bool:
-    """Droid 在任务完成时插入的通知。开头带任务 id，后面可以是很长的交付。"""
-    head = record_notice_text(record)[:BACKGROUND_HEAD_CHARS]
-    return "Background task completed" in head and "reason: completed" in head
-
-
-def is_background_task_error(record: dict[str, Any]) -> bool:
-    """只给模型看的任务失败。任务已经不在跑。用户自己贴出的同样文字不算。"""
-    if not is_llm_only_message(record):
-        return False
-    head = record_notice_text(record)[:BACKGROUND_HEAD_CHARS]
-    return head.startswith("Background task error.")
 
 
 def background_task_outstanding(records: list[dict[str, Any]]) -> bool:
     """这一轮里还有没结束的后台任务或后台命令。
 
-    子代理只认短的工具结果，或压缩提醒里的 child session。
+    子代理只认工具结果开头的 task_id/subagent_type 或 Task ID/Status，
+    以及记录 id 带 active-subagents 的压缩提醒里的 child session。
+    记录 id 为 task-completion: 时按 task_id 销掉。
     后台命令只认 Execute 的 input.fireAndForget 为布尔 true，键是工具调用 id。
     记录 id 为 execute-completion:<id> 时销掉这次调用，退出码不另判。
     用户新发的一句话清掉等待。插件注入的「这是自动续跑」不清。
-    工具结果里的英文状态句、PID 和压缩提醒里的命令清单都不参与。
+    PID、output_file 和压缩提醒里的命令清单都不参与。
     """
     outstanding: set[str] = set()
     for record in records:
@@ -959,18 +991,14 @@ def background_task_outstanding(records: list[dict[str, Any]]) -> bool:
         if finished_call:
             outstanding.discard(finished_call)
             continue
-        notice = record_notice_text(record)
-        if is_background_completion_notice(record):
-            outstanding.difference_update(background_task_ids(notice))
+        completed = task_completion_id(record)
+        if completed:
+            outstanding.discard(completed)
             continue
-        if is_background_task_error(record):
-            outstanding.difference_update(named_task_ids(notice))
+        compacted_ids = active_subagent_ids(record)
+        if compacted_ids:
+            outstanding.update(compacted_ids)
             continue
-        if notice and is_llm_only_message(record):
-            compacted_ids = compacted_task_ids(notice)
-            if compacted_ids:
-                outstanding.update(compacted_ids)
-                continue
         if is_plugin_continuation(record):
             continue
         if is_turn_boundary(record):
@@ -983,17 +1011,21 @@ def background_task_outstanding(records: list[dict[str, Any]]) -> bool:
             continue
         if message.get("role") == "assistant":
             outstanding.update(fire_and_forget_call_ids(message))
-        blob = tool_result_blob(message)
-        if background_wait_blob(blob):
-            outstanding.update(background_task_ids(blob))
-        elif background_done_blob(blob):
-            outstanding.difference_update(background_task_ids(blob))
+        update = tool_result_task_update(tool_result_blob(message))
+        if update is None:
+            continue
+        kind, task_ids = update
+        if kind == "wait":
+            outstanding.update(task_ids)
+        else:
+            outstanding.difference_update(task_ids)
     return bool(outstanding)
 
 
 def waiting_on_background_task(message: dict[str, Any]) -> bool:
-    """紧前面的工具结果写明任务仍在跑，或启动时已经写明不要轮询。"""
-    return background_wait_blob(tool_result_blob(message))
+    """紧前面的工具结果开头标明任务刚启动，或 Status 仍是 running。"""
+    update = tool_result_task_update(tool_result_blob(message))
+    return update is not None and update[0] == "wait"
 
 
 def is_deliberate_empty_stop(records: list[dict[str, Any]]) -> bool:
@@ -1729,6 +1761,10 @@ def codex_model_name(stop_payload: dict[str, Any]) -> str:
 
 def failure_is_retryable(message: str) -> bool:
     """只有限流、服务端临时故障和连接中断值得重试。
+
+    Codex 把结构化原因写在 rollout 的 task_complete.error.codex_error_info，
+    Droid 写在 agent_turn_outcome.reason。两条都在钩子返回之后才落盘，
+    决策时读不到，只能看这段已经写好的错误文本。
 
     先排除终态错误再认可重试特征：认证失败的消息里也可能带 "429" 之外的状态码，
     反过来 5xx 的正文里也可能出现 "invalid" 之类的词。终态优先，避免白等。

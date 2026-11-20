@@ -195,6 +195,17 @@ def llm_only(text: str, record_id: str = "llm-1") -> dict[str, object]:
     }
 
 
+def task_launch(task_id: str) -> str:
+    """Droid 把任务放到后台时，工具结果开头的字段。不靠说明性的英文句子。"""
+    return (
+        "Task launched in background.\n"
+        f"task_id: {task_id}\n"
+        "session_id: 11111111-1111-1111-1111-111111111111\n"
+        "subagent_type: worker\n"
+        "description: survey\n"
+    )
+
+
 def tool_result(
     text: str,
     record_id: str = "result-1",
@@ -458,18 +469,12 @@ class SilentStopTests(unittest.TestCase):
     def test_ignores_a_stop_while_a_background_task_is_still_running(self) -> None:
         running = (
             "Task ID: 41fc7afc-6992-464a-9cfd-73cc890b980a\n"
+            "Subagent Type: Worker\n"
+            "Description: review the plan\n"
             "Status: running\n"
             "Duration: 1217.8s\n"
-            "\n"
-            "Latest progress: OK [Process exited with code 0]\n"
-            "Task is still running in session \"41fc7afc-6992-464a-9cfd-73cc890b980a\"."
         )
-        launched = (
-            "Task launched in background.\n"
-            "The task is running in a subagent session.\n"
-            "You will be notified automatically when it completes and its report will be "
-            "delivered to you: do not wait for it or poll for it with TaskOutput."
-        )
+        launched = task_launch("3ec75d3f-bca9-463f-b2ca-30d10e05f4fb")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             running_path = root / "running.jsonl"
@@ -971,13 +976,7 @@ class UnfinishedStopTests(unittest.TestCase):
     def test_ignores_open_todos_while_a_background_task_is_still_running(self) -> None:
         """实测误报：进度说明写完了，待办留给后台代理，中间还夹了一次 TodoWrite。"""
         task_id = "3ec75d3f-bca9-463f-b2ca-30d10e05f4fb"
-        launched = (
-            "Task launched in background.\n"
-            f"task_id: {task_id}\n"
-            "The task is running in a subagent session.\n"
-            "You will be notified automatically when it completes and its report will be "
-            "delivered to you: do not wait for it or poll for it with TaskOutput."
-        )
+        launched = task_launch(task_id)
         stdout = self.run_single(
             [
                 user("继续 Google 2026 第二阶段"),
@@ -1000,14 +999,8 @@ class UnfinishedStopTests(unittest.TestCase):
         stdout = self.run_single(
             [
                 user("两路一起查"),
-                tool_result(
-                    f"task_id: {running}\ndo not wait for it or poll for it with TaskOutput.",
-                    record_id="launch-running",
-                ),
-                tool_result(
-                    f"task_id: {done}\ndo not wait for it or poll for it with TaskOutput.",
-                    record_id="launch-done",
-                ),
+                tool_result(task_launch(running), record_id="launch-running"),
+                tool_result(task_launch(done), record_id="launch-done"),
                 tool_result(
                     f"Task ID: {done}\nStatus: completed\n审查结论：可以收工。",
                     record_id="done-result",
@@ -1025,16 +1018,13 @@ class UnfinishedStopTests(unittest.TestCase):
         stdout = self.run_single(
             [
                 user("继续 Google 2026 第二阶段"),
-                tool_result(
-                    f"task_id: {task_id}\ndo not wait for it or poll for it with TaskOutput.",
-                    record_id="launch-result",
-                ),
-                user(
-                    "Background task completed.\n"
+                tool_result(task_launch(task_id), record_id="launch-result"),
+                llm_only(
+                    "Background task stopped.\n"
                     f"task_id: {task_id}\n"
-                    "reason: completed\n"
+                    "reason: cancelled\n"
                     "output: 干跑还差负样本。",
-                    record_id="task-completion",
+                    record_id=f"task-completion:{task_id}",
                 ),
                 todo_write(("补负样本", "in_progress")),
                 todos(("补负样本", "in_progress")),
@@ -1069,8 +1059,7 @@ class UnfinishedStopTests(unittest.TestCase):
             [
                 user("继续"),
                 tool_result(
-                    "task_id: 3ec75d3f-bca9-463f-b2ca-30d10e05f4fb\n"
-                    "do not wait for it or poll for it with TaskOutput.",
+                    task_launch("3ec75d3f-bca9-463f-b2ca-30d10e05f4fb"),
                     record_id="launch-result",
                 ),
                 todo_write(("回写 Excel", "in_progress")),
@@ -1383,7 +1372,10 @@ class UnfinishedStopTests(unittest.TestCase):
         waiting = self.run_single(
             [
                 user("Your standard model budget is exhausted. You have been switched to kimi-k3."),
-                llm_only(reminder, record_id="compact-reminder"),
+                llm_only(
+                    reminder,
+                    record_id="__internal__system-reminder__active-subagents__569333f8-c766-4556-8b6c-95db7113d559",
+                ),
                 todo_write(("等 P2/P3", "in_progress")),
                 todos(("等 P2/P3", "in_progress")),
                 assistant("status-wait", [{"type": "text", "text": "P1 已完成，等 P2/P3 结束后再提交。"}]),
@@ -1391,10 +1383,25 @@ class UnfinishedStopTests(unittest.TestCase):
         )
         self.assertEqual(waiting.strip(), "本轮任务正常完成。")
 
+        quoted = self.run_single(
+            [
+                user(reminder),
+                todo_write(("等 P2/P3", "in_progress")),
+                todos(("等 P2/P3", "in_progress")),
+                assistant("status-quote", [{"type": "text", "text": "P1 已完成，等 P2/P3 结束后再提交。"}]),
+            ]
+        )
+        quoted_output = json.loads(quoted)
+        self.assertEqual(quoted_output["decision"], "block")
+        self.assertIn("未完成项：等 P2/P3。", quoted_output["reason"])
+
         finished = self.run_single(
             [
                 user("Your standard model budget is exhausted. You have been switched to kimi-k3."),
-                llm_only(reminder, record_id="compact-reminder"),
+                llm_only(
+                    reminder,
+                    record_id="__internal__system-reminder__active-subagents__569333f8-c766-4556-8b6c-95db7113d559",
+                ),
                 llm_only(
                     "Background task completed.\n"
                     f"task_id: {child}\n"
@@ -1416,16 +1423,13 @@ class UnfinishedStopTests(unittest.TestCase):
         stdout = self.run_single(
             [
                 user("做后台"),
-                tool_result(
-                    f"task_id: {task_id}\ndo not wait for it or poll for it with TaskOutput.",
-                    record_id="launch-error",
-                ),
+                tool_result(task_launch(task_id), record_id="launch-error"),
                 llm_only(
                     "Background task error.\n"
                     f"task_id: {task_id}\n"
                     "reason: model_provider_unreachable\n"
                     "failure: The model provider could not be reached.",
-                    record_id="task-error",
+                    record_id=f"task-completion:{task_id}",
                 ),
                 todo_write(("改报表", "in_progress")),
                 todos(("改报表", "in_progress")),
@@ -1436,6 +1440,24 @@ class UnfinishedStopTests(unittest.TestCase):
         output = json.loads(stdout)
         self.assertEqual(output["decision"], "block")
         self.assertIn("未完成项：改报表。", output["reason"])
+
+        quoted = self.run_single(
+            [
+                user("做后台"),
+                tool_result(task_launch(task_id), record_id="launch-quoted"),
+                llm_only(
+                    "Background task completed.\n"
+                    f"task_id: {task_id}\n"
+                    "reason: completed\n"
+                    "output: 干跑还差负样本。",
+                    record_id="note-quoted",
+                ),
+                todo_write(("改报表", "in_progress"), record_id="todo-call-quoted"),
+                todos(("改报表", "in_progress"), record_id="todo-quoted"),
+                assistant("status-quoted", [{"type": "text", "text": "子代理好像结束了。"}]),
+            ]
+        )
+        self.assertEqual(quoted.strip(), "本轮任务正常完成。")
 
     def test_compacted_shell_reminder_does_not_track_the_command(self) -> None:
         output_file = "/tmp/droid-bg-37245.out"
