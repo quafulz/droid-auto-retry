@@ -57,6 +57,8 @@ TODO_TOOL_NAMES = {"todowrite"}
 PENDING_TODO_STATUSES = {"in_progress", "pending"}
 SUMMARY_TAGS = ("analysis", "summary")
 CODE_FENCE = "```"
+# 行尾粘住语言名的围栏，例如「改为 600```bash」。句子中间单独的 ``` 不算。
+GLUED_OPEN_FENCE = re.compile(r"(?:^|[^`~\s])(`{3}|~{3})([A-Za-z0-9_+-]+)[ \t]*$")
 
 # API 失败后续跑的参数。Codex 自己的重试基数是 200ms、总共只有约 3 秒，对 429 的
 # 限流窗口远远不够；这里用独立的退避预算，靠 hook 进程自己等。
@@ -155,6 +157,7 @@ TERMINAL_FAILURE_HINTS = (
     "bad request",
     "content policy",
     "content_filter",
+    "sensitive_words_detected",
     "quota",
     "billing",
     "insufficient",
@@ -203,6 +206,16 @@ TASK_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.IGNORECASE,
 )
+CHILD_SESSION_RE = re.compile(
+    r"child session:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+COMPACTED_SUBAGENT_HEADER = (
+    "Subagents that were still running when this conversation was compacted:"
+)
+COMPACTED_SUBAGENT_NOTE = "do not poll, wake, cancel, or resume them based on this list."
+# Droid 在命令结束时另写一条记录，id 是这个前缀加上当初的工具调用 id。
+EXECUTE_COMPLETION_PREFIX = "execute-completion:"
 
 CONTINUATION_REASON = "继续。上一轮在思考阶段中断，没有输出正文，也没有发出工具调用。"
 CONTINUATION_REASONS = {
@@ -441,20 +454,28 @@ def text_is_compaction_summary(text: str) -> bool:
 
 
 def text_has_open_code_fence(text: str) -> bool:
-    """只认行首的围栏，正文里引用的 ``` 不算。"""
+    """只认行首的围栏，正文里引用的 ``` 不算。
+
+    流被掐断时，开头的换行会丢掉，变成行尾的 600```bash。
+    这种紧贴语言名的围栏算打开，后面的行首围栏能把它关上。
+    """
     open_marker = ""
     for line in text.splitlines():
         stripped = line.lstrip(" ")
-        if len(line) - len(stripped) > 3:
+        if len(line) - len(stripped) <= 3:
+            fence = stripped[:3]
+            if fence in {CODE_FENCE, "~~~"}:
+                marker = stripped[0]
+                if not open_marker:
+                    open_marker = marker
+                elif open_marker == marker:
+                    open_marker = ""
+                continue
+        if open_marker:
             continue
-        fence = stripped[:3]
-        if fence not in {CODE_FENCE, "~~~"}:
-            continue
-        marker = stripped[0]
-        if not open_marker:
-            open_marker = marker
-        elif open_marker == marker:
-            open_marker = ""
+        match = GLUED_OPEN_FENCE.search(line)
+        if match:
+            open_marker = match.group(1)[0]
     return bool(open_marker)
 
 
@@ -839,28 +860,118 @@ def is_turn_boundary(record: dict[str, Any]) -> bool:
     return is_user_text_record(record) is not None
 
 
-def is_background_completion_notice(record: dict[str, Any]) -> bool:
-    """Droid 在任务完成时插入的通知。开头带任务 id，后面可以是很长的交付。"""
+def is_llm_only_message(record: dict[str, Any]) -> bool:
+    message = record.get("message")
+    return isinstance(message, dict) and message.get("visibility") == "llm_only"
+
+
+def record_notice_text(record: dict[str, Any]) -> str:
+    """用户角色的纯文本，含只给模型看的系统通知。工具结果除外。"""
+    if record.get("type") != "message" or is_hook_execution_record(record):
+        return ""
+    message = record.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return ""
+    if blocks_of_type(message, "tool_result"):
+        return ""
+    return message_text(message)
+
+
+def is_plugin_continuation(record: dict[str, Any]) -> bool:
+    """插件注入的续跑提示。它不是用户新开的一轮。"""
     message = is_user_text_record(record)
     if message is None:
         return False
-    head = message_text(message)[:BACKGROUND_HEAD_CHARS]
+    text = message_text(message)
+    return text.startswith("继续。") and "这是自动续跑" in text
+
+
+def execute_completion_call_id(record: dict[str, Any]) -> str:
+    """记录 id 为 execute-completion:<工具调用 id> 时，返回这次调用的 id。"""
+    record_id = record.get("id")
+    if not isinstance(record_id, str) or not record_id.startswith(EXECUTE_COMPLETION_PREFIX):
+        return ""
+    return record_id[len(EXECUTE_COMPLETION_PREFIX) :]
+
+
+def fire_and_forget_call_ids(message: dict[str, Any]) -> list[str]:
+    """Execute 且 input.fireAndForget 为布尔 true。键是工具调用 id。"""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    found: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in TOOL_BLOCK_TYPES:
+            continue
+        if block.get("name") != "Execute":
+            continue
+        tool_input = block.get("input")
+        if not isinstance(tool_input, dict) or tool_input.get("fireAndForget") is not True:
+            continue
+        tool_id = block.get("id")
+        if isinstance(tool_id, str) and tool_id:
+            found.append(tool_id)
+    return found
+
+
+def compacted_task_ids(text: str) -> set[str]:
+    """压缩提醒里仍在跑的子代理。只取 child session，不取 invocation。"""
+    if len(text) > MAX_BACKGROUND_WAIT_CHARS:
+        return set()
+    if COMPACTED_SUBAGENT_HEADER not in text or COMPACTED_SUBAGENT_NOTE not in text:
+        return set()
+    return {match.group(1).lower() for match in CHILD_SESSION_RE.finditer(text)}
+
+
+def named_task_ids(text: str) -> set[str]:
+    return {
+        match.group(0).lower()
+        for match in TASK_ID_RE.finditer(text[:BACKGROUND_HEAD_CHARS])
+    }
+
+
+def is_background_completion_notice(record: dict[str, Any]) -> bool:
+    """Droid 在任务完成时插入的通知。开头带任务 id，后面可以是很长的交付。"""
+    head = record_notice_text(record)[:BACKGROUND_HEAD_CHARS]
     return "Background task completed" in head and "reason: completed" in head
 
 
-def background_task_outstanding(records: list[dict[str, Any]]) -> bool:
-    """这一轮里还有没结束的后台任务。
+def is_background_task_error(record: dict[str, Any]) -> bool:
+    """只给模型看的任务失败。任务已经不在跑。用户自己贴出的同样文字不算。"""
+    if not is_llm_only_message(record):
+        return False
+    head = record_notice_text(record)[:BACKGROUND_HEAD_CHARS]
+    return head.startswith("Background task error.")
 
-    等待标记只认短的工具结果。用户自己贴出同样的文字会成为新的一轮，
-    不会被当成任务仍在运行。完成通知和 `Status: completed` 按任务 id 销掉；
-    没有 id 的等待只被没有 id 的完成结果销掉。
+
+def background_task_outstanding(records: list[dict[str, Any]]) -> bool:
+    """这一轮里还有没结束的后台任务或后台命令。
+
+    子代理只认短的工具结果，或压缩提醒里的 child session。
+    后台命令只认 Execute 的 input.fireAndForget 为布尔 true，键是工具调用 id。
+    记录 id 为 execute-completion:<id> 时销掉这次调用，退出码不另判。
+    用户新发的一句话清掉等待。插件注入的「这是自动续跑」不清。
+    工具结果里的英文状态句、PID 和压缩提醒里的命令清单都不参与。
     """
     outstanding: set[str] = set()
     for record in records:
+        finished_call = execute_completion_call_id(record)
+        if finished_call:
+            outstanding.discard(finished_call)
+            continue
+        notice = record_notice_text(record)
         if is_background_completion_notice(record):
-            notice = record.get("message")
-            if isinstance(notice, dict):
-                outstanding.difference_update(background_task_ids(message_text(notice)))
+            outstanding.difference_update(background_task_ids(notice))
+            continue
+        if is_background_task_error(record):
+            outstanding.difference_update(named_task_ids(notice))
+            continue
+        if notice and is_llm_only_message(record):
+            compacted_ids = compacted_task_ids(notice)
+            if compacted_ids:
+                outstanding.update(compacted_ids)
+                continue
+        if is_plugin_continuation(record):
             continue
         if is_turn_boundary(record):
             outstanding.clear()
@@ -870,6 +981,8 @@ def background_task_outstanding(records: list[dict[str, Any]]) -> bool:
         message = record.get("message")
         if not isinstance(message, dict):
             continue
+        if message.get("role") == "assistant":
+            outstanding.update(fire_and_forget_call_ids(message))
         blob = tool_result_blob(message)
         if background_wait_blob(blob):
             outstanding.update(background_task_ids(blob))
