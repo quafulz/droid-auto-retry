@@ -124,8 +124,18 @@ def write_transcript(path: Path, records: list[dict[str, object]]) -> None:
     )
 
 
-def assistant(record_id: str, content: list[dict[str, object]] | str | None) -> dict[str, object]:
+CUSTOM_DROP_MODEL = "custom:Drop Model-1"
+
+
+def assistant(
+    record_id: str,
+    content: list[dict[str, object]] | str | None,
+    *,
+    model_id: str | None = None,
+) -> dict[str, object]:
     message: dict[str, object] = {"role": "assistant", "content": content}
+    if model_id is not None:
+        message["modelId"] = model_id
     return {"type": "message", "id": record_id, "message": message}
 
 
@@ -312,7 +322,11 @@ class SilentStopTests(unittest.TestCase):
                             {"type": "tool_use", "name": "Execute", "input": {"command": "pwd"}},
                         ],
                     ),
-                    assistant("drop-1", [{"type": "thinking", "thinking": "流在这里断了"}]),
+                    assistant(
+                        "drop-1",
+                        [{"type": "thinking", "thinking": "流在这里断了"}],
+                        model_id=CUSTOM_DROP_MODEL,
+                    ),
                     outcome(),
                 ],
             )
@@ -323,7 +337,49 @@ class SilentStopTests(unittest.TestCase):
         self.assertEqual(output["decision"], "block")
         self.assertIn("自动续跑 1/4", output["reason"])
         self.assertIn("不要重复已经完成", output["reason"])
-        self.assertEqual(output["systemMessage"], "Custom Model 发生中断，正在自动重试 1/4...")
+        self.assertEqual(output["systemMessage"], "Drop Model 发生中断，正在自动重试 1/4...")
+
+    def test_ignores_a_silent_stop_from_a_factory_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            factory = root / "factory.jsonl"
+            missing = root / "missing.jsonl"
+            write_transcript(
+                factory,
+                [
+                    assistant(
+                        "drop-factory",
+                        [{"type": "thinking", "thinking": "流在这里断了"}],
+                        model_id="claude-opus-5-5",
+                    )
+                ],
+            )
+            write_transcript(
+                missing,
+                [assistant("drop-missing", [{"type": "thinking", "thinking": "流在这里断了"}])],
+            )
+            factory_result = run_hook(payload(factory), root / "state-factory")
+            missing_result = run_hook(payload(missing), root / "state-missing")
+
+        self.assertEqual(factory_result.stdout, "")
+        self.assertEqual(missing_result.stdout, "")
+
+    def test_factory_model_still_continues_for_open_todos(self) -> None:
+        stdout = UnfinishedStopTests().run_single(
+            [
+                todo_write(("回写 Excel", "in_progress")),
+                todos(("回写 Excel", "in_progress")),
+                assistant(
+                    "text-factory",
+                    [{"type": "text", "text": "已处理完主要部分。"}],
+                    model_id="claude-opus-5-5",
+                ),
+            ]
+        )
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("任务尚未完成，正在自动续跑 1/4", output["systemMessage"])
 
     def test_ignores_a_thinking_only_reply_to_the_empty_end_reminder(self) -> None:
         reminder = (
@@ -359,6 +415,7 @@ class SilentStopTests(unittest.TestCase):
                                 "durationMs": 0,
                             }
                         ],
+                        model_id=CUSTOM_DROP_MODEL,
                     ),
                 ],
             )
@@ -375,7 +432,11 @@ class SilentStopTests(unittest.TestCase):
                 transcript,
                 [
                     user("请按这句话做：end the turn by replying with no text and no tool calls"),
-                    assistant("drop", [{"type": "thinking", "thinking": "流在这里断了"}]),
+                    assistant(
+                        "drop",
+                        [{"type": "thinking", "thinking": "流在这里断了"}],
+                        model_id=CUSTOM_DROP_MODEL,
+                    ),
                 ],
             )
             result = run_hook(payload(transcript), root / "state")
@@ -405,14 +466,22 @@ class SilentStopTests(unittest.TestCase):
                 running_path,
                 [
                     tool_result(running),
-                    assistant("yield-running", [{"type": "thinking", "thinking": ""}]),
+                    assistant(
+                        "yield-running",
+                        [{"type": "thinking", "thinking": ""}],
+                        model_id=CUSTOM_DROP_MODEL,
+                    ),
                 ],
             )
             write_transcript(
                 launched_path,
                 [
                     tool_result(launched, record_id="launch-result"),
-                    assistant("yield-launched", [{"type": "thinking", "thinking": "先停，等通知"}]),
+                    assistant(
+                        "yield-launched",
+                        [{"type": "thinking", "thinking": "先停，等通知"}],
+                        model_id=CUSTOM_DROP_MODEL,
+                    ),
                 ],
             )
             running_result = run_hook(payload(running_path), root / "state-running")
@@ -435,7 +504,11 @@ class SilentStopTests(unittest.TestCase):
                 finished_path,
                 [
                     tool_result(finished),
-                    assistant("drop-finished", [{"type": "thinking", "thinking": ""}]),
+                    assistant(
+                        "drop-finished",
+                        [{"type": "thinking", "thinking": ""}],
+                        model_id=CUSTOM_DROP_MODEL,
+                    ),
                 ],
             )
             long_path = root / "long.jsonl"
@@ -443,7 +516,11 @@ class SilentStopTests(unittest.TestCase):
                 query_path,
                 [
                     tool_result("2021 871 0.00\n2022 1656 0.00\n[Process exited with code 0]"),
-                    assistant("drop-query", [{"type": "thinking", "thinking": "我一次跑：按月统计。"}]),
+                    assistant(
+                        "drop-query",
+                        [{"type": "thinking", "thinking": "我一次跑：按月统计。"}],
+                        model_id=CUSTOM_DROP_MODEL,
+                    ),
                 ],
             )
             write_transcript(
@@ -453,7 +530,11 @@ class SilentStopTests(unittest.TestCase):
                         "Status: running\nTask is still running\n" + ("x" * 4000),
                         record_id="long-result",
                     ),
-                    assistant("drop-long", [{"type": "thinking", "thinking": "日志还没看完"}]),
+                    assistant(
+                        "drop-long",
+                        [{"type": "thinking", "thinking": "日志还没看完"}],
+                        model_id=CUSTOM_DROP_MODEL,
+                    ),
                 ],
             )
             finished_result = run_hook(payload(finished_path), root / "state-finished")
@@ -537,6 +618,7 @@ class SilentStopTests(unittest.TestCase):
                             {"type": "reasoning", "text": "hidden"},
                             {"type": "text", "text": "  \n"},
                         ],
+                        model_id=CUSTOM_DROP_MODEL,
                     )
                 ],
             )
@@ -545,7 +627,7 @@ class SilentStopTests(unittest.TestCase):
         self.assertIn("自动续跑 1/4", result.stdout)
         self.assertEqual(
             json.loads(result.stdout)["systemMessage"],
-            "Custom Model 发生中断，正在自动重试 1/4...",
+            "Drop Model 发生中断，正在自动重试 1/4...",
         )
 
     def test_system_message_uses_the_custom_model_display_name(self) -> None:
@@ -617,17 +699,17 @@ class SilentStopTests(unittest.TestCase):
             transcript = root / "session.jsonl"
             write_transcript(
                 transcript,
-                [assistant("drop-1", [{"type": "thinking", "thinking": "一次"}])],
+                [assistant("drop-1", [{"type": "thinking", "thinking": "一次"}], model_id=CUSTOM_DROP_MODEL)],
             )
             first = run_hook(payload(transcript), state)
             write_transcript(
                 transcript,
-                [assistant("drop-2", [{"type": "thinking", "thinking": "两次"}])],
+                [assistant("drop-2", [{"type": "thinking", "thinking": "两次"}], model_id=CUSTOM_DROP_MODEL)],
             )
             second = run_hook(payload(transcript, stop_hook_active=True), state)
             write_transcript(
                 transcript,
-                [assistant("drop-3", [{"type": "thinking", "thinking": "新一轮"}])],
+                [assistant("drop-3", [{"type": "thinking", "thinking": "新一轮"}], model_id=CUSTOM_DROP_MODEL)],
             )
             reset = run_hook(payload(transcript, stop_hook_active=False), state)
 
@@ -645,14 +727,14 @@ class SilentStopTests(unittest.TestCase):
             transcript = root / "session.jsonl"
             write_transcript(
                 transcript,
-                [assistant("same-drop", [{"type": "thinking", "thinking": "一次"}])],
+                [assistant("same-drop", [{"type": "thinking", "thinking": "一次"}], model_id=CUSTOM_DROP_MODEL)],
             )
             env = {"DROID_AUTO_CONTINUE_MAX_ATTEMPTS": "1"}
             first = run_hook(payload(transcript), state, env_updates=env)
             duplicate = run_hook(payload(transcript), state, env_updates=env)
             write_transcript(
                 transcript,
-                [assistant("next-drop", [{"type": "thinking", "thinking": "两次"}])],
+                [assistant("next-drop", [{"type": "thinking", "thinking": "两次"}], model_id=CUSTOM_DROP_MODEL)],
             )
             capped = run_hook(
                 payload(transcript, stop_hook_active=True),
@@ -680,13 +762,13 @@ class SilentStopTests(unittest.TestCase):
             transcript = root / "session.jsonl"
             write_transcript(
                 transcript,
-                [assistant("drop-1", [{"type": "thinking", "thinking": "一次"}])],
+                [assistant("drop-1", [{"type": "thinking", "thinking": "一次"}], model_id=CUSTOM_DROP_MODEL)],
             )
             first = run_hook(payload(transcript, stop_hook_active=True), state)
             write_transcript(
                 transcript,
                 [
-                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}]),
+                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}], model_id=CUSTOM_DROP_MODEL),
                     user("继续。自动续跑 1/4。", "user-2"),
                     assistant(
                         "work-1",
@@ -699,7 +781,7 @@ class SilentStopTests(unittest.TestCase):
                             }
                         ],
                     ),
-                    assistant("drop-2", [{"type": "thinking", "thinking": "两次"}]),
+                    assistant("drop-2", [{"type": "thinking", "thinking": "两次"}], model_id=CUSTOM_DROP_MODEL),
                 ],
             )
             second = run_hook(payload(transcript, stop_hook_active=True), state)
@@ -726,7 +808,7 @@ class SilentStopTests(unittest.TestCase):
                             }
                         ],
                     ),
-                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}]),
+                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}], model_id=CUSTOM_DROP_MODEL),
                 ],
             )
             first = run_hook(payload(transcript, stop_hook_active=True), state)
@@ -744,9 +826,9 @@ class SilentStopTests(unittest.TestCase):
                             }
                         ],
                     ),
-                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}]),
+                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}], model_id=CUSTOM_DROP_MODEL),
                     user("继续。自动续跑 1/4。", "user-2"),
-                    assistant("drop-2", [{"type": "thinking", "thinking": "两次"}]),
+                    assistant("drop-2", [{"type": "thinking", "thinking": "两次"}], model_id=CUSTOM_DROP_MODEL),
                 ],
             )
             second = run_hook(payload(transcript, stop_hook_active=True), state)
@@ -794,7 +876,7 @@ class SilentStopTests(unittest.TestCase):
                             }
                         ],
                     ),
-                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}]),
+                    assistant("drop-1", [{"type": "thinking", "thinking": "一次"}], model_id=CUSTOM_DROP_MODEL),
                 ],
             )
             result = run_hook(payload(transcript, stop_hook_active=True), state)
@@ -873,6 +955,139 @@ class UnfinishedStopTests(unittest.TestCase):
         self.assertIn("未完成项：校验修改结果并汇报；补充缺失章节。", output["reason"])
         self.assertIn("先对账", output["reason"])
         self.assertIn("标成 completed", output["reason"])
+
+    def test_ignores_open_todos_while_a_background_task_is_still_running(self) -> None:
+        """实测误报：进度说明写完了，待办留给后台代理，中间还夹了一次 TodoWrite。"""
+        task_id = "3ec75d3f-bca9-463f-b2ca-30d10e05f4fb"
+        launched = (
+            "Task launched in background.\n"
+            f"task_id: {task_id}\n"
+            "The task is running in a subagent session.\n"
+            "You will be notified automatically when it completes and its report will be "
+            "delivered to you: do not wait for it or poll for it with TaskOutput."
+        )
+        stdout = self.run_single(
+            [
+                user("继续 Google 2026 第二阶段"),
+                tool_result(launched, record_id="launch-result"),
+                todo_write(("冻结抽取并干跑", "in_progress"), ("审查后发布", "pending")),
+                todos(("冻结抽取并干跑", "in_progress"), ("审查后发布", "pending")),
+                tool_result("TODO List Updated", record_id="todo-result", tool_use_id="todo-call-1-use"),
+                assistant(
+                    "status-1",
+                    [{"type": "text", "text": "第二阶段第 1 步已交给排查代理，发布脚本这段时间我不碰。"}],
+                ),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_keeps_waiting_when_another_background_task_is_still_running(self) -> None:
+        running = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        done = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        stdout = self.run_single(
+            [
+                user("两路一起查"),
+                tool_result(
+                    f"task_id: {running}\ndo not wait for it or poll for it with TaskOutput.",
+                    record_id="launch-running",
+                ),
+                tool_result(
+                    f"task_id: {done}\ndo not wait for it or poll for it with TaskOutput.",
+                    record_id="launch-done",
+                ),
+                tool_result(
+                    f"Task ID: {done}\nStatus: completed\n审查结论：可以收工。",
+                    record_id="done-result",
+                ),
+                todo_write(("等还在跑的那一路", "in_progress")),
+                todos(("等还在跑的那一路", "in_progress")),
+                assistant("status-2", [{"type": "text", "text": "一路已经回来了，另一路还在跑。"}]),
+            ]
+        )
+
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
+
+    def test_continues_open_todos_after_the_background_task_completes(self) -> None:
+        task_id = "3ec75d3f-bca9-463f-b2ca-30d10e05f4fb"
+        stdout = self.run_single(
+            [
+                user("继续 Google 2026 第二阶段"),
+                tool_result(
+                    f"task_id: {task_id}\ndo not wait for it or poll for it with TaskOutput.",
+                    record_id="launch-result",
+                ),
+                user(
+                    "Background task completed.\n"
+                    f"task_id: {task_id}\n"
+                    "reason: completed\n"
+                    "output: 干跑还差负样本。",
+                    record_id="task-completion",
+                ),
+                todo_write(("补负样本", "in_progress")),
+                todos(("补负样本", "in_progress")),
+                assistant("status-3", [{"type": "text", "text": "代理交回来了，我先看到这里。"}]),
+            ]
+        )
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("未完成项：补负样本。", output["reason"])
+
+    def test_user_quoting_the_background_phrase_does_not_hide_open_todos(self) -> None:
+        stdout = self.run_single(
+            [
+                user("日志里有一句 do not wait for it or poll for it with TaskOutput，请处理待办。"),
+                todo_write(("回写 Excel", "in_progress")),
+                todos(("回写 Excel", "in_progress")),
+                assistant("status-4", [{"type": "text", "text": "已处理完主要部分。"}]),
+            ]
+        )
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("未完成项：回写 Excel。", output["reason"])
+
+    def test_still_continues_a_summary_while_a_background_task_is_running(self) -> None:
+        summary = (
+            "<analysis>\nLet me chronologically analyze this conversation.\n</analysis>\n"
+            "<summary>\n1. Launched the subagent.\n2. Still writing the plan.\n</summary>"
+        )
+        stdout = self.run_single(
+            [
+                user("继续"),
+                tool_result(
+                    "task_id: 3ec75d3f-bca9-463f-b2ca-30d10e05f4fb\n"
+                    "do not wait for it or poll for it with TaskOutput.",
+                    record_id="launch-result",
+                ),
+                todo_write(("回写 Excel", "in_progress")),
+                todos(("回写 Excel", "in_progress")),
+                assistant("summary-2", [{"type": "text", "text": summary}]),
+            ]
+        )
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("上下文压缩摘要", output["reason"])
+
+    def test_long_running_tool_result_does_not_hide_open_todos(self) -> None:
+        stdout = self.run_single(
+            [
+                user("看日志"),
+                tool_result(
+                    "Status: running\nTask is still running\n" + ("x" * 4000),
+                    record_id="long-result",
+                ),
+                todo_write(("回写 Excel", "in_progress")),
+                todos(("回写 Excel", "in_progress")),
+                assistant("status-5", [{"type": "text", "text": "已处理完主要部分。"}]),
+            ]
+        )
+
+        output = json.loads(stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("未完成项：回写 Excel。", output["reason"])
 
     def test_ignores_an_open_todo_when_work_happened_after_the_plan_update(self) -> None:
         """实测误报：计划里留了 in_progress，之后又跑了 55 次工具并提交，计划已过时。"""
@@ -2370,7 +2585,11 @@ class DroidFailureStopTests(unittest.TestCase):
             silent = self.run_stop(
                 [
                     provider_error("BYOK Error: 429 Too Many Requests", "old-err"),
-                    assistant("drop", [{"type": "thinking", "thinking": "流在这里断了"}]),
+                    assistant(
+                        "drop",
+                        [{"type": "thinking", "thinking": "流在这里断了"}],
+                        model_id=CUSTOM_DROP_MODEL,
+                    ),
                 ],
                 root / "state-b",
                 root / "silent.jsonl",

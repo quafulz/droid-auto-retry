@@ -2,17 +2,18 @@
 
 Factory Droid 和 Codex 插件。Custom Model 的回合没有真正做完就停下来时，用 Stop hook 自动发送「继续」。
 
-这个插件对应当前两边的 Stop 行为：`decision: "block"` 会带着 `reason` 再开一轮，并把 `stop_hook_active` 设为 true。它不重放底层 HTTP 请求。Droid 读自己的 transcript。Codex 读 rollout 里的 `response_item`，判定结论相同。
+这个插件对应当前两边的 Stop 行为：`decision: "block"` 会带着 `reason` 再开一轮，并把 `stop_hook_active` 设为 true。它不重放底层 HTTP 请求。Droid 读自己的 transcript。Codex 读 rollout 里的 `response_item`。压缩摘要、截断、待办和 API 失败两边相同。Droid 的静默中断只续跑 `modelId` 以 `custom:` 开头的模型；Codex 不看这个前缀。
 
 ## 什么时候会续跑
 
 看当前会话 transcript 里最后一条 assistant 消息，以及它之前的待办状态：
 
-- 只有 `thinking` / `reasoning`，或者正文是空白：续跑。TUI 会多一条系统消息，形如 `Hook message: APUS Private DS v4.1 Flash #2 发生中断，正在自动重试 1/4...`。`Hook message:` 是 Droid 加的前缀。模型名优先用这条 assistant 消息的 `modelId` 在 Custom Model 设置里对应的 displayName；对不上时从 id 里取出 `custom:<名字>-<序号>` 的名字。没有模型 id 时显示 `Custom Model`。
-- 两种空回复不续跑，也不打印「本轮任务正常完成。」：上一条是只给模型看的系统提醒，写明没有可做的事时用无正文、无工具调用结束回合；或者上一条是短的工具结果，写明后台任务仍在运行（`Status: running` 且 `Task is still running`），或任务启动时写明不要用 `TaskOutput` 轮询。用户自己把这些句子贴进对话，或普通工具结果后面只剩思考，仍按中断续跑。
+- 只有 `thinking` / `reasoning`，或者正文是空白：Droid 仅当这条 assistant 消息的 `modelId` 以 `custom:` 开头时续跑。自带模型（如 `claude-opus-5-5`）、没有 `modelId`、或前缀不是 `custom:` 时不续跑，也不打印「本轮任务正常完成。」。Codex 的静默中断仍续跑，不看这个前缀。TUI 会多一条系统消息，形如 `Hook message: APUS Private DS v4.1 Flash #2 发生中断，正在自动重试 1/4...`。`Hook message:` 是 Droid 加的前缀。模型名优先用这条 assistant 消息的 `modelId` 在 Custom Model 设置里对应的 displayName；对不上时从 id 里取出 `custom:<名字>-<序号>` 的名字。没有模型 id 时显示 `Custom Model`。
+- 两种空回复不续跑，也不打印「本轮任务正常完成。」：上一条是只给模型看的系统提醒，写明没有可做的事时用无正文、无工具调用结束回合；或者上一条是短的工具结果，写明后台任务仍在运行（`Status: running` 且 `Task is still running`），或任务启动时写明不要用 `TaskOutput` 轮询。用户自己把这些句子贴进对话，或普通工具结果后面只剩思考，Droid 上仍只对 `custom:` 模型按中断续跑；Codex 仍续跑。
 - 正文是上下文压缩摘要：续跑。自动压缩时模型会输出 `<analysis>...</analysis><summary>...</summary>`，这类消息只是摘要，不是给用户的答复。细分场景下系统消息是 `... 任务尚未完成，正在自动续跑 1/4...`。
 - 正文被截断：代码块 ` ``` ` 未闭合，或 `<analysis>` / `<summary>` 有开无闭：续跑。
 - 正文以工具调用协议片段收尾：续跑。Custom Model 偶尔把 `<｜DSML｜ ...>`、`<antml:...>` 这类片段当成正文输出，回合就此结束，工具并没有真的调用。只认落在正文末尾的标记，正文中间引用、或整段写在代码块里讨论都不会命中。
+- 后台任务还在这一轮里跑：工具结果里有一条不长的记录，写明 `Status: running` 且 `Task is still running`，或写明不要用 `TaskOutput` 轮询，并且之后没有这个任务 id 的 `Status: completed`，也没有 `Background task completed` 且 `reason: completed` 的完成通知。模型已经写出完整正文时，待办未完成也不续跑，按正常结束打印「本轮任务正常完成。」中间夹着 `TodoWrite` 的结果也一样。新的用户消息会清掉这个等待。用户自己贴出这些句子、超长工具结果、压缩摘要、截断正文和工具协议泄漏，仍按各自的规则。空回复只看紧前面的那一条工具结果，不因为更早的后台任务而跳过静默中断。
 - 待办列表仍有 `in_progress` / `pending`：续跑，`reason` 里会列出未完成项，并要求先对账（已完成的标 `completed`，还缺什么就说清）。证据只取 transcript 里 Droid 写的 `todo_state` 记录，插件不解读任何字样。这个记录有两种形态：模型按契约传结构化 `todos` 时，直接读每项的 `status`；模型把整份清单当字符串传时，Droid 可能逐行解析成带 `status` 的条目，也可能解析不出而把整行原样留下、状态落成默认的 `pending`。判别不靠状态词表，只看解析是否真的发生：解析成功的那一行，条目的 `content` 一定比原行短（状态标记和行首序号被剥掉）；解析失败的那一行，`content` 与原行只差行首序号。只要有任意一行两者相等，就说明这一行的状态是默认值，整份清单弃权。行数与条目数对不上、找不到对应的 `todo_state` 时同样弃权。此外，最后一次 `TodoWrite` 之后只要还发过工具调用，这份计划就算过时（模型常常先更新计划、再干完收尾的活、然后直接写总结），也弃权。弃权等于不续跑，因此模型怎么写待办都不会触发误判，代价是拿不到这份证据。
 - 正文以提问收尾：不续跑。末尾是 `?` / `？`，或结尾出现「请确认」「是否需要」「要不要」这类说法，视为模型在等你回答。此时即使待办未完成也停住。
 - 其他可见正文：不续跑。Droid 的 TUI 里这条 Stop hook 下面会多一行「本轮任务正常完成。」Codex 把非 JSON 输出当成钩子失败，所以正常结束时什么都不打印。

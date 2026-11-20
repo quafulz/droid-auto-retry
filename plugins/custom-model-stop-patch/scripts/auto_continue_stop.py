@@ -197,6 +197,12 @@ ENDING_COMPLETE = "complete"
 ENDING_IDLE = "idle"
 EMPTY_END_INSTRUCTION = "end the turn by replying with no text and no tool calls"
 MAX_BACKGROUND_WAIT_CHARS = 4000
+BACKGROUND_HEAD_CHARS = 500
+BACKGROUND_WAIT_PHRASE = "do not wait for it or poll for it with TaskOutput"
+TASK_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
 
 CONTINUATION_REASON = "继续。上一轮在思考阶段中断，没有输出正文，也没有发出工具调用。"
 CONTINUATION_REASONS = {
@@ -771,20 +777,110 @@ def reminded_to_end_without_output(record: dict[str, Any], message: dict[str, An
     return isinstance(record_id, str) and record_id.startswith("__internal__system-reminder__")
 
 
-def waiting_on_background_task(message: dict[str, Any]) -> bool:
-    """TaskOutput 仍在跑，或任务启动时已经写明不要轮询。"""
+def tool_result_blob(message: dict[str, Any]) -> str:
     parts: list[str] = []
     for block in blocks_of_type(message, "tool_result"):
         text = block.get("text")
         if isinstance(text, str):
             parts.append(text)
         parts.append(joined_text(block.get("content")))
-    blob = "\n".join(part for part in parts if part)
+    return "\n".join(part for part in parts if part)
+
+
+def background_wait_blob(blob: str) -> bool:
+    """短工具结果里的等待标记。超长结果弃权，避免大段日志碰巧带上同样的句子。"""
     if not blob or len(blob) > MAX_BACKGROUND_WAIT_CHARS:
         return False
     if "Status: running" in blob and "Task is still running" in blob:
         return True
-    return "do not wait for it or poll for it with TaskOutput" in blob
+    return BACKGROUND_WAIT_PHRASE in blob
+
+
+def background_done_blob(blob: str) -> bool:
+    """完成标记看开头。交付正文可以很长，状态行仍在前面。"""
+    if not blob:
+        return False
+    return "Status: completed" in blob[:BACKGROUND_HEAD_CHARS]
+
+
+def background_task_ids(blob: str) -> set[str]:
+    found = {
+        match.group(0).lower()
+        for match in TASK_ID_RE.finditer(blob[:BACKGROUND_HEAD_CHARS])
+    }
+    return found or {"*"}
+
+
+def message_text(message: dict[str, Any]) -> str:
+    return joined_text(message.get("content")).strip()
+
+
+def is_user_text_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    """用户自己写的正文。工具结果、系统提醒和钩子执行记录除外。"""
+    if record.get("type") != "message" or is_hook_execution_record(record):
+        return None
+    message = record.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    if message.get("visibility") == "llm_only":
+        return None
+    record_id = record.get("id")
+    if isinstance(record_id, str) and record_id.startswith("__internal__"):
+        return None
+    if blocks_of_type(message, "tool_result"):
+        return None
+    if not message_text(message):
+        return None
+    return message
+
+
+def is_turn_boundary(record: dict[str, Any]) -> bool:
+    """用户新发的一句话把上一轮的后台任务隔开。"""
+    return is_user_text_record(record) is not None
+
+
+def is_background_completion_notice(record: dict[str, Any]) -> bool:
+    """Droid 在任务完成时插入的通知。开头带任务 id，后面可以是很长的交付。"""
+    message = is_user_text_record(record)
+    if message is None:
+        return False
+    head = message_text(message)[:BACKGROUND_HEAD_CHARS]
+    return "Background task completed" in head and "reason: completed" in head
+
+
+def background_task_outstanding(records: list[dict[str, Any]]) -> bool:
+    """这一轮里还有没结束的后台任务。
+
+    等待标记只认短的工具结果。用户自己贴出同样的文字会成为新的一轮，
+    不会被当成任务仍在运行。完成通知和 `Status: completed` 按任务 id 销掉；
+    没有 id 的等待只被没有 id 的完成结果销掉。
+    """
+    outstanding: set[str] = set()
+    for record in records:
+        if is_background_completion_notice(record):
+            notice = record.get("message")
+            if isinstance(notice, dict):
+                outstanding.difference_update(background_task_ids(message_text(notice)))
+            continue
+        if is_turn_boundary(record):
+            outstanding.clear()
+            continue
+        if record.get("type") != "message":
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        blob = tool_result_blob(message)
+        if background_wait_blob(blob):
+            outstanding.update(background_task_ids(blob))
+        elif background_done_blob(blob):
+            outstanding.difference_update(background_task_ids(blob))
+    return bool(outstanding)
+
+
+def waiting_on_background_task(message: dict[str, Any]) -> bool:
+    """紧前面的工具结果写明任务仍在跑，或启动时已经写明不要轮询。"""
+    return background_wait_blob(tool_result_blob(message))
 
 
 def is_deliberate_empty_stop(records: list[dict[str, Any]]) -> bool:
@@ -815,11 +911,16 @@ def classify_ending(
         return ENDING_SILENT, ""
     if assistant_has_unknown_block(message):
         return ENDING_UNKNOWN, ""
-    return classify_text(
+    kind, detail = classify_text(
         assistant_visible_text(message),
         pending_todo_labels(records),
         detect_unfinished=detect_unfinished,
     )
+    # 完整答复加上还开着的待办，通常是忘了收尾。后台任务还在跑时，
+    # 模型是停下来等通知，待办留着 in_progress 不是中断。
+    if kind == ENDING_TODOS and background_task_outstanding(records):
+        return ENDING_COMPLETE, ""
+    return kind, detail
 
 
 def assistant_identity(record: dict[str, Any]) -> str:
@@ -1190,6 +1291,12 @@ def model_id_from_message(message: dict[str, Any]) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def is_droid_custom_model(message: dict[str, Any]) -> bool:
+    """Droid 自定义模型的 modelId 以 custom: 开头。自带模型和缺 id 都不是。"""
+    model_id = message.get("modelId")
+    return isinstance(model_id, str) and model_id.startswith("custom:")
 
 
 def name_from_model_id(model_id: str) -> str:
@@ -3531,6 +3638,10 @@ def main() -> int:
         message,
         detect_unfinished=detect_unfinished,
     )
+    # 静默中断只重试自定义模型。Codex 在上面已经返回，不经过这里。
+    # 自带模型的空回复不当成正常答复播报。
+    if kind == ENDING_SILENT and not is_droid_custom_model(message):
+        kind = ENDING_IDLE
     return finish_classified(
         session_id=session_id,
         stop_hook_active=stop_hook_active,
