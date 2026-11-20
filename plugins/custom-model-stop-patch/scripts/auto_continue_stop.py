@@ -2,7 +2,8 @@
 """Stop hook：回合没有真正做完时，有限次自动继续。
 
 Droid 读自己的 transcript。Codex 读 rollout 里的 response_item。
-两边的续跑结论一致：静默中断、压缩摘要、截断、协议泄漏、未完成待办会续跑。
+两边的续跑结论一致：静默中断、压缩摘要、截断、协议泄漏会续跑。
+普通正文写完就停，待办清单没勾完不算中断。
 
 采样请求在 API 层失败（429、5xx、流中断）时，两边的出口不同。
 
@@ -170,21 +171,7 @@ LEAKED_MARKUP_TAIL = re.compile(
     r"|<[／/]?\s*(?:function_calls|function_results)[^>]{0,120}>\s*$",
     re.IGNORECASE,
 )
-QUESTION_PHRASES = (
-    "请确认",
-    "请提供",
-    "请选择",
-    "请告知",
-    "是否需要",
-    "是否继续",
-    "要不要",
-    "需要我",
-    "可以吗",
-    "告诉我",
-    "确认一下",
-)
 MAX_TODO_LABEL_CHARS = 60
-MAX_TODO_LABELS = 5
 LIST_NUMBER_PREFIX = re.compile(r"^\s*\d+[.)、．]\s*")
 
 ENDING_SILENT = "silent"
@@ -251,7 +238,6 @@ CODEX_TOOL_TYPES = {
     "web_search_call",
     "image_generation_call",
 }
-CODEX_PLAN_NAMES = {"updateplan", "todowrite"}
 CODEX_TEXT_BLOCK_TYPES = {"output_text", "input_text"}
 CODEX_BOUNDARY_TYPES = {
     "additional_tools",
@@ -503,18 +489,6 @@ def text_ends_with_leaked_tool_markup(text: str) -> bool:
     return bool(LEAKED_MARKUP_TAIL.search(text))
 
 
-def text_looks_like_a_question(text: str) -> bool:
-    tail = text.strip()[-400:]
-    if not tail:
-        return False
-    stripped = tail.rstrip("`*_> \t\r\n")
-    if stripped.endswith(("?", "？")):
-        return True
-    if stripped.endswith(("。", ".", "!", "！")):
-        return False
-    return any(phrase in stripped[-120:] for phrase in QUESTION_PHRASES)
-
-
 def todo_label(item: dict[str, Any]) -> str:
     content = item.get("content")
     if isinstance(content, str) and content.strip():
@@ -661,17 +635,6 @@ def work_after_call(
     )
 
 
-def last_todo_tool_items(records: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
-    """返回最后一次 TodoWrite 采信后的待办项；无证据时为 None。"""
-    calls = list(iter_todo_write_calls(records))
-    if not calls:
-        return None
-    call_index, call_position, block = calls[-1]
-    if work_after_call(records, call_index, call_position):
-        return None
-    return todo_evidence_for_call(records, call_index, block)
-
-
 def last_tool_call_marker(records: list[dict[str, Any]]) -> str:
     """transcript 里最后一次工具调用的身份，用来判断两次中断之间有没有干活。
 
@@ -692,32 +655,16 @@ def last_tool_call_marker(records: list[dict[str, Any]]) -> str:
     return marker
 
 
-def pending_todo_labels(records: list[dict[str, Any]]) -> list[str]:
-    items = last_todo_tool_items(records)
-    if not items:
-        return []
-    return [
-        todo_label(item)
-        for item in items
-        if todo_status(item) in PENDING_TODO_STATUSES
-    ]
-
-
-def format_todo_detail(labels: list[str]) -> str:
-    shown = labels[:MAX_TODO_LABELS]
-    detail = "未完成项：" + "；".join(shown)
-    if len(labels) > len(shown):
-        detail += f" 等 {len(labels)} 项"
-    return detail + "。"
-
-
 def classify_text(
     text: str,
-    labels: list[str],
     *,
     detect_unfinished: bool,
 ) -> tuple[str, str]:
-    """可见正文上的未完成判定。空白正文视为已经完成。"""
+    """可见正文上的未完成判定。空白正文视为已经完成。
+
+    普通正文就是这一轮的结尾。待办还开着只说明清单没勾完，不是回合中断。
+    不读正文措辞来猜测结论写完没有。
+    """
     if not text.strip() or not detect_unfinished:
         return ENDING_COMPLETE, ""
     if text_is_compaction_summary(text):
@@ -726,10 +673,6 @@ def classify_text(
         return ENDING_TRUNCATED, ""
     if text_ends_with_leaked_tool_markup(text):
         return ENDING_LEAK, ""
-    if text_looks_like_a_question(text):
-        return ENDING_COMPLETE, ""
-    if labels:
-        return ENDING_TODOS, format_todo_detail(labels)
     return ENDING_COMPLETE, ""
 
 
@@ -1056,16 +999,10 @@ def classify_ending(
         return ENDING_SILENT, ""
     if assistant_has_unknown_block(message):
         return ENDING_UNKNOWN, ""
-    kind, detail = classify_text(
+    return classify_text(
         assistant_visible_text(message),
-        pending_todo_labels(records),
         detect_unfinished=detect_unfinished,
     )
-    # 完整答复加上还开着的待办，通常是忘了收尾。后台任务还在跑时，
-    # 模型是停下来等通知，待办留着 in_progress 不是中断。
-    if kind == ENDING_TODOS and background_task_outstanding(records):
-        return ENDING_COMPLETE, ""
-    return kind, detail
 
 
 def assistant_identity(record: dict[str, Any]) -> str:
@@ -1607,69 +1544,6 @@ def codex_message_parts(payload: dict[str, Any]) -> tuple[str, bool]:
     return "".join(parts), unknown
 
 
-def normalized_tool_name(value: str) -> str:
-    leaf = value.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[-1]
-    return leaf.replace("_", "").replace("-", "").lower()
-
-
-def codex_call_arguments(payload: dict[str, Any]) -> Any:
-    raw = payload.get("arguments") if "arguments" in payload else payload.get("input")
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-    return raw
-
-
-def codex_plan_items(value: Any) -> list[dict[str, Any]] | None:
-    """Codex 的 update_plan 用 plan[].step；也接受已经是 todos[].content 的入参。"""
-    if not isinstance(value, dict):
-        return None
-    plan = value.get("plan")
-    if isinstance(plan, list):
-        items: list[dict[str, Any]] = []
-        for entry in plan:
-            if not isinstance(entry, dict):
-                return None
-            label = entry.get("step")
-            if not isinstance(label, str) or not label.strip():
-                label = entry.get("content")
-            status = entry.get("status")
-            if not isinstance(label, str) or not label.strip():
-                return None
-            if not isinstance(status, str) or not status.strip():
-                return None
-            items.append({"content": label, "status": status})
-        return items
-    if "todos" in value:
-        return validated_todo_items(value.get("todos"))
-    return None
-
-
-def codex_pending_labels(payloads: list[dict[str, Any]]) -> list[str]:
-    """最后一次结构化 update_plan。之后又有工具调用则计划过时，弃权。"""
-    last_index: int | None = None
-    last_items: list[dict[str, Any]] | None = None
-    for index, payload in enumerate(payloads):
-        if payload.get("type") not in {"function_call", "custom_tool_call"}:
-            continue
-        name = payload.get("name")
-        if not isinstance(name, str) or normalized_tool_name(name) not in CODEX_PLAN_NAMES:
-            continue
-        last_index = index
-        last_items = codex_plan_items(codex_call_arguments(payload))
-    if last_index is None or not last_items:
-        return []
-    if any(payload.get("type") in CODEX_TOOL_TYPES for payload in payloads[last_index + 1 :]):
-        return []
-    return [
-        todo_label(item)
-        for item in last_items
-        if todo_status(item) in PENDING_TODO_STATUSES
-    ]
-
-
 def classify_codex(
     payloads: list[dict[str, Any]],
     *,
@@ -1706,7 +1580,6 @@ def classify_codex(
     if text.strip():
         return classify_text(
             text,
-            codex_pending_labels(payloads),
             detect_unfinished=detect_unfinished,
         )
     if saw_compaction and not saw_reasoning and not saw_assistant:

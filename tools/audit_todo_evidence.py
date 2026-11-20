@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""复核 Stop hook 的待办判据在真实 transcript 上的表现。
+"""复核 Stop hook 在真实 transcript 上的收尾判定。
 
-回答两个问题：哪些会话因为待办被判续跑、其中哪些其实已经做完；以及
-`work_after_call` 这条过时弃权有没有漏掉真正的续跑信号。脚本只读 transcript，
+普通正文即使待办还开着也判 `complete`，不再因为清单续跑。脚本只读 transcript，
 不修改任何状态。
 
-    python3 tools/audit_todo_evidence.py --since 2026-09
-    python3 tools/audit_todo_evidence.py --since 2026-10 --verdict todos --tail 200
+    python3 tools/audit_todo_evidence.py --since 2026-09 --verdict complete
     python3 tools/audit_todo_evidence.py --json > audit.json
 """
 

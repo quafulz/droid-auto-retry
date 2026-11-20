@@ -1,36 +1,64 @@
 # droid-auto-retry
 
-Factory Droid 和 Codex 共用的插件市场。目前只有一个插件：[custom-model-stop-patch](plugins/custom-model-stop-patch/README.md)。
+面向 **Factory Droid** 和 **Codex** 的自动重试插件，插件名：[custom-model-stop-patch](plugins/custom-model-stop-patch/README.md)。
 
-Custom Model 的回合没有真正做完就停下来时（静默中断、压缩摘要、正文截断、待办未完成），Stop hook 会自动发送「继续」。Droid 的静默中断只对 `modelId` 以 `custom:` 开头的模型生效，Codex 不受这条约束。
+## 解决什么问题
 
-采样请求在 API 层失败时（429、5xx、流中断）也会续跑。Droid 这时已经进入 Stop，插件确认是可重试错误后，退避并用 `decision: block` 在当前进程里再开一轮。Codex 不发 Stop，插件改听 `PostModelRequest`；退避后先执行 `codex queue --thread <session_id> --message <续跑提示> --resume`。queue 成功只表示消息已持久入队，只有 rollout 出现不同 `turn_id` 的新 `task_started` 才算恢复；短 settle 窗口内没看到新 turn 时，job 保持 `queued`，由后续 hook 在验证期限内继续核对，超期仍未确认则标为 `completed_unverified`，仍不等于恢复。只有 queue 明确不支持时，才回退到等待写锁后执行 `codex exec resume`；超时或其它非零结果视为未知，不自动 fallback，也不重复投递。同一 session 和 turn 的多个不同错误只投递一次。exec fallback 会还原原命令行上的 provider、沙箱和审批设置。认证失败、配额、上下文超限、内容策略和敏感词不重试。
+在使用 Custom Model（自定义模型/第三方 API 网关）进行长程编码任务时，Agent 常常在任务还没真正做完时意外停下来，导致用户需要反复手动输入「继续」或重新发起会话。常见中断包括：
 
-## 安装
+- **静默或半途中断**：只输出了思考过程或空白内容、上下文自动压缩后停在摘要、代码/标签被截断、工具调用协议片段泄漏到正文。待办清单没勾完不算中断。
+- **可重试的 API 层错误**：遇到限流（429）、服务端异常（5xx）或网络/流连接中断时，原生重试窗口过短或直接退出回合。
 
-需要对应的 CLI，以及 Python 3.10+（命令是 `python3`）。
+本插件在检测到上述「假结束」或可重试故障时，自动以指数退避的方式触发续跑；同时对真正需要人工介入的场景（如模型主动提问确认、认证失败、配额耗尽、上下文超限、内容策略拦截等）保持静默，不盲目重试。
 
-Droid：
+## 原理
+
+插件不重放底层 HTTP 请求，而是通过 Droid 和 Codex 的 **Hook 机制** 结合本地会话记录（transcript / rollout）判断回合是否真正完成，并在下一轮中要求模型先对账已完成的操作再继续：
+
+1. **未完成回合续跑（Stop Hook）**
+   在每次回合停止时检查最后一条输出。若命中未完成特征，插件会阻塞本次停止并自动注入续跑提示；若模型已经写出普通正文、后台任务仍在运行，或已达到连续重试上限，则正常放行。
+2. **API 层失败自动恢复**
+   - **Droid**：API 失败仍会进入 Stop 阶段，插件确认属于可重试错误后，在当前会话进程内退避并拉起下一轮。
+   - **Codex**：API 失败不会触发 Stop，插件通过 `PostModelRequest` 监听失败信号，并在独立后台进程中完成退避与恢复——优先将续跑消息安全写入原会话队列，仅在不支持队列时回退到 `exec resume`（自动继承原进程的模型、Provider 与沙箱设置），并以会话记录中出现新 turn 作为恢复确认依据。
+
+## 快速开始
+
+### 环境要求
+
+- Factory Droid CLI 或 Codex CLI
+- Python 3.10+（需可通过 `python3` 调用）
+
+### 安装
+
+**Droid：**
 
 ```bash
 droid plugin marketplace add https://github.com/quafulz/droid-auto-retry
 droid plugin install custom-model-stop-patch@droid-auto-retry
 ```
 
-Codex：
+**Codex：**
 
 ```bash
 codex plugin marketplace add https://github.com/quafulz/droid-auto-retry
 codex plugin add custom-model-stop-patch@droid-auto-retry
 ```
 
-安装后新开一个会话。Droid 用 `/hooks` 确认 Stop hook 已启用。
+### 使用与验证
 
-## 文档
+安装完成后，**新开一个会话**即可自动生效（无需修改日常使用方式）：
 
-判定规则、不会处理的情况、安装细节、环境变量和开发用的复核脚本，都写在[插件 README](plugins/custom-model-stop-patch/README.md)。那份是唯一来源，本文件只做入口。
+- 在 **Droid** 中可通过 `/hooks` 确认 Stop hook 已启用；后续通过 `droid plugin update` 更新插件通常无需重启会话。
+- 在 **Codex** 中安装或更新后建议新开一个会话。
+- 如需调整最大重试次数、退避时间或状态目录等行为，可通过环境变量配置。
 
-## 开发
+## 详细文档
+
+完整的判定规则、边界与不处理场景、Codex 后台恢复状态机、全部环境变量说明及排障方法，请查阅：
+
+- [custom-model-stop-patch 完整文档](plugins/custom-model-stop-patch/README.md)
+
+## 开发与测试
 
 ```bash
 python3 -m pytest -q

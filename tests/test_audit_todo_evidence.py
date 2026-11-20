@@ -86,7 +86,7 @@ class AuditScriptTests(unittest.TestCase):
             check=False,
         )
 
-    def test_reports_an_open_plan_as_would_continue(self) -> None:
+    def test_reports_an_open_plan_as_a_normal_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             session = root / "-Users-someone-Projects-demo"
@@ -99,10 +99,22 @@ class AuditScriptTests(unittest.TestCase):
                     assistant("text-1", [{"type": "text", "text": "校准还在跑。"}]),
                 ],
             )
-            result = self.run_script(root)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--sessions-root",
+                    str(root),
+                    "--verdict",
+                    "complete",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("判定=todos", result.stdout)
+        self.assertIn("判定=complete", result.stdout)
         self.assertIn("未完成=1/2", result.stdout)
         self.assertIn("跑校准", result.stdout)
         self.assertIn("work_after_call 反事实：0 个会话的判定会变化", result.stdout)
@@ -124,8 +136,8 @@ class AuditScriptTests(unittest.TestCase):
             result = self.run_script(root)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("work_after_call 反事实：1 个会话的判定会变化", result.stdout)
-        self.assertIn("complete -> todos", result.stdout)
+        self.assertIn("work_after_call 反事实：0 个会话的判定会变化", result.stdout)
+        self.assertNotIn("complete -> todos", result.stdout)
 
     def test_json_output_is_parseable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -150,7 +162,7 @@ class AuditScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = json.loads(result.stdout)
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["verdict"], "todos")
+        self.assertEqual(rows[0]["verdict"], "complete")
         self.assertEqual(rows[0]["open"], ["复核结果"])
 
     def test_reports_no_sessions_when_the_root_is_empty(self) -> None:

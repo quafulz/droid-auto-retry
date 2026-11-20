@@ -2,7 +2,7 @@
 
 Factory Droid 和 Codex 插件。Custom Model 的回合没有真正做完就停下来时，用 Stop hook 自动发送「继续」。
 
-这个插件对应当前两边的 Stop 行为：`decision: "block"` 会带着 `reason` 再开一轮，并把 `stop_hook_active` 设为 true。它不重放底层 HTTP 请求。Droid 读自己的 transcript。Codex 读 rollout 里的 `response_item`。压缩摘要、截断、待办和 API 失败两边相同。Droid 的静默中断只续跑 `modelId` 以 `custom:` 开头的模型；Codex 不看这个前缀。
+这个插件对应当前两边的 Stop 行为：`decision: "block"` 会带着 `reason` 再开一轮，并把 `stop_hook_active` 设为 true。它不重放底层 HTTP 请求。Droid 读自己的 transcript。Codex 读 rollout 里的 `response_item`。压缩摘要、截断和 API 失败两边相同。Droid 的静默中断只续跑 `modelId` 以 `custom:` 开头的模型；Codex 不看这个前缀。
 
 ## 什么时候会续跑
 
@@ -14,9 +14,8 @@ Factory Droid 和 Codex 插件。Custom Model 的回合没有真正做完就停�
 - 正文被截断：代码块 ` ``` ` 未闭合，或 `<analysis>` / `<summary>` 有开无闭：续跑。只认行首、缩进不超过 3 个空格的围栏。行尾粘着语言名的 `600```bash` 也算打开，后面的行首 ` ``` ` 能把它关上。句子中间单独出现的 ` ``` ` 不算。
 - 正文以工具调用协议片段收尾：续跑。Custom Model 偶尔把 `<｜DSML｜ ...>`、`<antml:...>` 这类片段当成正文输出，回合就此结束，工具并没有真的调用。只认落在正文末尾的标记，正文中间引用、或整段写在代码块里讨论都不会命中。
 - 后台任务还在这一轮里跑：工具结果开头同时有 `task_id` 和 `subagent_type`，或同时有 `Task ID` 和单独成行的 `Status: running`。之后同一 id 的 `Status` 换成别的词（如 `completed`、`error`），或出现记录 id 以 `task-completion:` 开头的 `llm_only` 通知（读其中的 `task_id`；`reason` 是 `completed`、`cancelled`、`error` 都算结束），就把这个任务销掉。模型已经写出完整正文时，待办未完成也不续跑，按正常结束打印「本轮任务正常完成。」中间夹着 `TodoWrite` 的结果也一样。新的用户消息会清掉这个等待。用户自己贴出这些字段、压缩摘要、截断正文和工具协议泄漏，仍按各自的规则。空回复只看紧前面的那一条工具结果，不因为更早的后台任务而跳过静默中断。Droid 的 `Execute` 在 `input.fireAndForget` 为布尔值 `true` 时，按这次工具调用的 id 记住。记录 id 为 `execute-completion:` 加上这个 id 时销掉，任何退出码都销掉。启动句、完成句、PID、`output_file`、`Process exited`、`ps`，以及压缩提醒里的后台命令清单，都不算开始或结束。`run_in_background` 不算。调用已经落在所读 transcript 尾部之外时，钩子看不到它，压缩提醒也不会把它加回来。压缩后的系统提醒只有记录 id 含 `__internal__system-reminder__active-subagents__` 时，才按其中的 `child session` 算还在跑，不取 `invocation`。插件自己注入的「这是自动续跑」不算新的用户消息，不会把这些等待清掉。
-- 待办列表仍有 `in_progress` / `pending`：续跑，`reason` 里会列出未完成项，并要求先对账（已完成的标 `completed`，还缺什么就说清）。证据只取 transcript 里 Droid 写的 `todo_state` 记录，插件不解读任何字样。这个记录有两种形态：模型按契约传结构化 `todos` 时，直接读每项的 `status`；模型把整份清单当字符串传时，Droid 可能逐行解析成带 `status` 的条目，也可能解析不出而把整行原样留下、状态落成默认的 `pending`。判别不靠状态词表，只看解析是否真的发生：解析成功的那一行，条目的 `content` 一定比原行短（状态标记和行首序号被剥掉）；解析失败的那一行，`content` 与原行只差行首序号。只要有任意一行两者相等，就说明这一行的状态是默认值，整份清单弃权。行数与条目数对不上、找不到对应的 `todo_state` 时同样弃权。此外，最后一次 `TodoWrite` 之后只要还发过工具调用，这份计划就算过时（模型常常先更新计划、再干完收尾的活、然后直接写总结），也弃权。弃权等于不续跑，因此模型怎么写待办都不会触发误判，代价是拿不到这份证据。
-- 正文以提问收尾：不续跑。末尾是 `?` / `？`，或结尾出现「请确认」「是否需要」「要不要」这类说法，视为模型在等你回答。此时即使待办未完成也停住。
-- 其他可见正文：不续跑。Droid 的 TUI 里这条 Stop hook 下面会多一行「本轮任务正常完成。」Codex 把非 JSON 输出当成钩子失败，所以正常结束时什么都不打印。
+- 待办清单还开着：不续跑。模型已经写出普通正文并停下来时，`in_progress` / `pending` 只说明勾没划掉，不说明回合中断。不读这段正文来判断结论写完没有。压缩摘要、截断和协议泄漏仍按各自的规则续跑，不因为清单开着就改判。
+- 其他可见正文：不续跑，包括正文是在向你提问。Droid 的 TUI 里这条 Stop hook 下面会多一行「本轮任务正常完成。」Codex 把非 JSON 输出当成钩子失败，所以正常结束时什么都不打印。
 - 已经发出工具调用：不续跑，交给 Droid 执行工具。
 - 出现无法识别的内容块：不续跑。
 - transcript 还没写出这条消息、路径不可读，或 Stop payload 缺字段：不续跑。
@@ -24,7 +23,7 @@ Factory Droid 和 Codex 插件。Custom Model 的回合没有真正做完就停�
 
 同一轮里连续自动续跑默认最多 4 次。判定「连续」依据 transcript 里的最后一次工具调用：再次 Stop 时如果已经出现了新的工具调用，说明模型在两次中断之间真的干了活，连续次数从 1 重新开始计；全新的用户消息（`stop_hook_active` 为 false）同样从 1 开始。只看 `stop_hook_active` 不够：实测 Droid 在整个续跑链里始终把它置为 true，跑完 104 次工具调用之后的一次中断仍会被算成连续第 3 次，次数很快用完，之后真正的压缩摘要中断就不再续跑。所以插件自己比对 transcript 里的工具调用 id。次数用完后停住；下一条新的用户消息会重新开始计数。主界面不显示 thinking，所以静默中断看起来像是工具输出之后直接停住。
 
-提问判断是文本启发式，不是语义理解。待办判断不看 assistant 正文，也不解析模型写的自由文本：它只比较「Droid 是否真的解析了每一行」这个结构事实，再读 `todo_state` 里已经成型的状态。模型如果一边说「接下来我会继续」一边结束回合，插件不会续跑；反过来，模型如果忘了把待办标成完成，可能被多续跑一次——续跑提示会先要它对账，属于这种情况时一般一轮就收住。上限 4 次保底。
+普通正文不因为措辞或待办清单续跑。模型如果一边说「接下来我会继续」一边结束回合，插件不会续跑；忘了把待办标成完成也不会再开一轮。上限 4 次只约束静默中断、压缩摘要、截断、协议泄漏和 API 失败。
 
 ## 不会处理的情况
 
@@ -53,7 +52,7 @@ Codex 的 transcript 是 rollout。一次采样里的思考是单独的 `reasoni
 和 Droid 的差别：
 
 - 模型名用 Stop payload 里的 `model`，不读 `.factory/settings.json`。
-- 待办读 `update_plan`（或名为 `TodoWrite` 的函数调用）里结构化的 `plan[].step` / `status`。入参不是结构化清单时弃权。最后一次计划之后又有工具调用，同样弃权。续跑提示里要求用 `update_plan` 对账。
+- 计划还开着也不续跑。`update_plan` 里的 `pending` / `in_progress` 和 Droid 的待办一样，不拿来判断这一轮有没有写完。
 - 只有 `compaction` / `context_compaction`、没有正文时，按压缩摘要续跑。
 - 正常结束不打印「本轮任务正常完成。」`systemMessage` 仍会输出，Codex 把它显示在钩子卡片上。
 - 子线程的 SubagentStop、用户取消时的 Interrupt 都不注册。
@@ -142,7 +141,7 @@ Droid 更新已经装好的插件不用重开会话。Droid 每一轮都会重�
 | 变量 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `DROID_AUTO_CONTINUE_MAX_ATTEMPTS` | `4` | `0-10`。`0` 关闭续跑 |
-| `DROID_AUTO_CONTINUE_DETECT_UNFINISHED` | `1` | `0-1`。`0` 只保留静默中断检测，忽略压缩摘要、截断、协议泄漏和待办信号 |
+| `DROID_AUTO_CONTINUE_DETECT_UNFINISHED` | `1` | `0-1`。`0` 只保留静默中断检测，忽略压缩摘要、截断和协议泄漏 |
 | `DROID_AUTO_CONTINUE_BASE_DELAY` | `2` | 第一次等待秒数 |
 | `DROID_AUTO_CONTINUE_MAX_DELAY` | `15` | 单次等待上限，硬上限 40 秒 |
 | `DROID_AUTO_CONTINUE_BACKOFF_FACTOR` | `2` | 连续中断时的退避倍数，范围 `1-4` |
@@ -192,4 +191,4 @@ python3 tools/audit_todo_evidence.py --since 2026-10 --tail 300
 python3 tools/audit_todo_evidence.py --json > audit.json
 ```
 
-输出会列出被判续跑的会话、它们的未完成项、收尾正文，以及 `work_after_call` 的反事实结果：如果把这条过时弃权关掉，哪些会话的判定会变。判断误报的办法是看收尾正文有没有已经把结果交付出来——交付了却仍被判续跑，就是误报。默认只看 `todos`，用 `--verdict` 可以加上 `complete`、`tool_use` 等其他判定。
+输出按 Stop hook 的当前判定分组。普通正文即使待办还开着也是 `complete`，不再因为清单续跑。默认只看 `todos`；现在这条判定不会出现，用 `--verdict complete` 看正常结束的会话。

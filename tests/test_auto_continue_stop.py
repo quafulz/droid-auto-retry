@@ -387,7 +387,7 @@ class SilentStopTests(unittest.TestCase):
         self.assertEqual(factory_result.stdout, "")
         self.assertEqual(missing_result.stdout, "")
 
-    def test_factory_model_still_continues_for_open_todos(self) -> None:
+    def test_factory_model_does_not_continue_for_open_todos(self) -> None:
         stdout = UnfinishedStopTests().run_single(
             [
                 todo_write(("回写 Excel", "in_progress")),
@@ -400,9 +400,7 @@ class SilentStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("任务尚未完成，正在自动续跑 1/4", output["systemMessage"])
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_ignores_a_thinking_only_reply_to_the_empty_end_reminder(self) -> None:
         reminder = (
@@ -949,7 +947,8 @@ class UnfinishedStopTests(unittest.TestCase):
         self.assertIn("自动续跑 1/4", output["reason"])
         self.assertEqual(output["systemMessage"], "Custom Model 任务尚未完成，正在自动续跑 1/4...")
 
-    def test_continues_when_todos_are_still_open(self) -> None:
+    def test_a_normal_reply_does_not_continue_for_open_todos(self) -> None:
+        """实测误报：正文已经写完，清单里还有 in_progress。勾没划掉不是中断。"""
         stdout = self.run_single(
             [
                 user("把 Excel 改完"),
@@ -967,11 +966,7 @@ class UnfinishedStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：校验修改结果并汇报；补充缺失章节。", output["reason"])
-        self.assertIn("先对账", output["reason"])
-        self.assertIn("标成 completed", output["reason"])
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_ignores_open_todos_while_a_background_task_is_still_running(self) -> None:
         """实测误报：进度说明写完了，待办留给后台代理，中间还夹了一次 TodoWrite。"""
@@ -1032,9 +1027,7 @@ class UnfinishedStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：补负样本。", output["reason"])
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_user_quoting_the_background_phrase_does_not_hide_open_todos(self) -> None:
         stdout = self.run_single(
@@ -1046,9 +1039,7 @@ class UnfinishedStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：回写 Excel。", output["reason"])
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_still_continues_a_summary_while_a_background_task_is_running(self) -> None:
         summary = (
@@ -1086,9 +1077,7 @@ class UnfinishedStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：回写 Excel。", output["reason"])
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def background_execute(
         self,
@@ -1184,9 +1173,7 @@ class UnfinishedStopTests(unittest.TestCase):
                         ),
                     ]
                 )
-                output = json.loads(stdout)
-                self.assertEqual(output["decision"], "block")
-                self.assertIn("未完成项：等重算。", output["reason"])
+                self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_another_command_exiting_does_not_finish_the_background_command(self) -> None:
         stdout = self.run_single(
@@ -1255,9 +1242,7 @@ class UnfinishedStopTests(unittest.TestCase):
                 assistant("status-done", [{"type": "text", "text": "清理进程已经退出，我先看到这里。"}]),
             ]
         )
-        output = json.loads(finished)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：核对归档。", output["reason"])
+        self.assertEqual(finished.strip(), "本轮任务正常完成。")
 
     def test_keeps_waiting_when_another_background_command_is_still_running(self) -> None:
         finish = (
@@ -1318,9 +1303,7 @@ class UnfinishedStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：改报表。", output["reason"])
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_user_quoting_a_background_command_does_not_hide_open_todos(self) -> None:
         stdout = self.run_single(
@@ -1335,9 +1318,7 @@ class UnfinishedStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：回写 Excel。", output["reason"])
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_long_background_command_result_does_not_hide_open_todos(self) -> None:
         stdout = self.run_single(
@@ -1353,9 +1334,7 @@ class UnfinishedStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：回写 Excel。", output["reason"])
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_compacted_subagent_reminder_hides_open_todos_until_it_finishes(self) -> None:
         child = "5e9a0e9a-f1e2-460c-803c-d161f01e00be"
@@ -1391,9 +1370,7 @@ class UnfinishedStopTests(unittest.TestCase):
                 assistant("status-quote", [{"type": "text", "text": "P1 已完成，等 P2/P3 结束后再提交。"}]),
             ]
         )
-        quoted_output = json.loads(quoted)
-        self.assertEqual(quoted_output["decision"], "block")
-        self.assertIn("未完成项：等 P2/P3。", quoted_output["reason"])
+        self.assertEqual(quoted.strip(), "本轮任务正常完成。")
 
         finished = self.run_single(
             [
@@ -1414,9 +1391,7 @@ class UnfinishedStopTests(unittest.TestCase):
                 assistant("status-back", [{"type": "text", "text": "子代理交回来了，我先看到这里。"}]),
             ]
         )
-        output = json.loads(finished)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：提交。", output["reason"])
+        self.assertEqual(finished.strip(), "本轮任务正常完成。")
 
     def test_background_task_error_clears_the_wait(self) -> None:
         task_id = "e8817e08-5a23-4c99-95bd-724bf3567f19"
@@ -1437,9 +1412,7 @@ class UnfinishedStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：改报表。", output["reason"])
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
         quoted = self.run_single(
             [
@@ -1485,9 +1458,7 @@ class UnfinishedStopTests(unittest.TestCase):
                 assistant("status-compact-shell", [{"type": "text", "text": "清理还在后台跑。"}]),
             ]
         )
-        output = json.loads(reminder_only)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：等清理。", output["reason"])
+        self.assertEqual(reminder_only.strip(), "本轮任务正常完成。")
 
         mismatched = self.run_single(
             [
@@ -1511,9 +1482,7 @@ class UnfinishedStopTests(unittest.TestCase):
                 assistant("status-compact-done", [{"type": "text", "text": "清理通知到了，我先看到这里。"}]),
             ]
         )
-        output = json.loads(finished)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("未完成项：核对。", output["reason"])
+        self.assertEqual(finished.strip(), "本轮任务正常完成。")
 
     def test_still_continues_a_summary_while_a_background_command_is_running(self) -> None:
         summary = (
@@ -1835,12 +1804,7 @@ class UnfinishedStopTests(unittest.TestCase):
             ]
         )
 
-        output = json.loads(stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn(
-            "未完成项：calib4 的 S1/R_full 运行中；填报告并给出正式判定。",
-            output["reason"],
-        )
+        self.assertEqual(stdout.strip(), "本轮任务正常完成。")
 
     def test_abstains_when_droid_kept_a_free_text_line_verbatim(self) -> None:
         """Droid 没认出这一行的状态时状态是默认的 pending，整份弃权。"""
@@ -2114,7 +2078,7 @@ class CodexStopTests(unittest.TestCase):
 
         self.assertEqual(result.stdout, "")
 
-    def test_continues_when_update_plan_still_has_open_steps(self) -> None:
+    def test_a_normal_reply_does_not_continue_for_open_plan_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             result = self.run_records(
@@ -2131,10 +2095,7 @@ class CodexStopTests(unittest.TestCase):
                 state=root / "state",
             )
 
-        output = json.loads(result.stdout)
-        self.assertIn("未完成项：校验修改结果并汇报；补充缺失章节", output["reason"])
-        self.assertIn("用 update_plan 把它们标成 completed", output["reason"])
-        self.assertNotIn("TodoWrite", output["reason"])
+        self.assertEqual(result.stdout, "")
 
     def test_ignores_an_update_plan_after_later_tool_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
