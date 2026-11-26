@@ -12,10 +12,13 @@ Droid 仍会进入 Stop，transcript 里已经有一条只给用户看的错误�
 所以不另起 `droid exec`。
 
 Codex 不发 Stop。插件听 PostModelRequest（失败时带 status=failed，输出不参与
-控制流），退避后先通过 `codex queue --thread ... --resume` 把续跑提示持久交给
-原会话；只有 queue 明确不受支持时才等待写锁并回退到 `codex exec resume`。
-queue 成功也不等于已恢复，必须由 rollout 出现不同 turn_id 的新 task_started
-证明；后台 helper 退出后由后续 hook 继续对账。
+控制流）。这是每一次采样失败都会发的事件，Codex 自己的重试循环仍可能在同一个
+turn 里继续。写锁还在、rollout 也还没有带可重试错误的 task_complete 时，不能
+把续跑提示塞进队列：消息会等到这一轮正常结束后才变成新的用户输入。确认回合
+确实死在可重试错误上，或写者已经离开且基线之后没有新的模型输出，才通过
+`codex queue --thread ... --resume` 投递；只有 queue 明确不受支持时才等待写锁
+并回退到 `codex exec resume`。queue 成功也不等于已恢复，必须由 rollout 出现
+不同 turn_id 的新 task_started 证明；后台 helper 退出后由后续 hook 继续对账。
 
 认证失败、配额、上下文超限和内容策略两边都不重试。
 """
@@ -81,6 +84,10 @@ DEFAULT_QUEUE_VERIFY_SECONDS = 900.0
 MAX_QUEUE_VERIFY_SECONDS = 24 * 60 * 60.0
 DEFAULT_QUEUE_COMMAND_TIMEOUT_SECONDS = 60.0
 MAX_QUEUE_COMMAND_TIMEOUT_SECONDS = 300.0
+# 采样失败后，原回合可能还要再跑几个小时。这段时间写锁一直被占着，
+# 提前入队会在正常 task_complete 之后被当成新的用户消息。
+DEFAULT_TURN_WATCH_SECONDS = 8 * 60 * 60.0
+MAX_TURN_WATCH_SECONDS = 24 * 60 * 60.0
 PROCESS_QUERY_TIMEOUT_SECONDS = 5.0
 MAX_PROCESS_ARG_COUNT = 4096
 MAX_RESUME_LOG_TAIL_BYTES = 8192
@@ -2063,6 +2070,16 @@ def queue_command_timeout_seconds() -> float:
     )
 
 
+def turn_watch_seconds() -> float:
+    """写锁仍被占用时，最多再观察多久才放弃投递。0 表示不观察。"""
+    return env_float(
+        "DROID_AUTO_CONTINUE_TURN_WATCH_SECONDS",
+        DEFAULT_TURN_WATCH_SECONDS,
+        minimum=0.0,
+        maximum=MAX_TURN_WATCH_SECONDS,
+    )
+
+
 def queue_resume_command(executable: str, session_id: str) -> list[str]:
     """返回 Codex 原生的持久队列命令。
 
@@ -2161,6 +2178,247 @@ def finish_queue_verification(
         detail=queued_detail + "; pending later rollout reconciliation",
     )
     return "handled"
+
+
+SKIP_TURN_COMPLETED = "the same turn completed without a retryable API error"
+SKIP_TURN_ABORTED = "the same turn was aborted before a resume was queued"
+SKIP_TURN_CONTINUED = "the same turn kept producing output after the API error"
+SKIP_TURN_STILL_OPEN = (
+    "the writer was still active when the watch ended; not queueing a resume"
+)
+QUEUE_TURN_FAILED = "the same turn ended with a retryable API error"
+SUPERSEDED_DURING_WATCH = "a new turn started while confirming the API failure"
+STANDBY_RESUME_STATES = frozenset({"scheduled", "waiting_lock"})
+
+
+def task_complete_error_text(error: Any) -> str:
+    if isinstance(error, str):
+        return error
+    if not isinstance(error, dict):
+        return ""
+    parts: list[str] = []
+    message = error.get("message")
+    if isinstance(message, str):
+        parts.append(message)
+    info = error.get("codex_error_info")
+    if isinstance(info, str):
+        parts.append(info)
+    elif isinstance(info, dict):
+        parts.append(json.dumps(info, ensure_ascii=False, sort_keys=True))
+    return " ".join(parts)
+
+
+def note_turn_activity(state: dict[str, Any], record: dict[str, Any], turn_id: str) -> None:
+    """把基线之后的一条 rollout 记录折进观察状态。
+
+    ``token_count`` 和工具结果不算模型又跑起来了。采样失败当下就会补一条
+    token 计数，真正的续写是 assistant 正文、reasoning 或新的工具调用。
+    已经有终态之后不再改判。
+    """
+    if state.get("terminal") in {"superseded", "failed", "completed", "aborted"}:
+        return
+    kind = record.get("type")
+    payload = record.get("payload")
+    if kind == "event_msg" and isinstance(payload, dict):
+        event_type = payload.get("type")
+        seen = payload.get("turn_id")
+        seen_turn = seen.strip() if isinstance(seen, str) else ""
+        if event_type == "task_started":
+            if seen_turn and seen_turn != turn_id:
+                state["terminal"] = "superseded"
+            return
+        if event_type == "turn_aborted":
+            if not seen_turn or seen_turn == turn_id:
+                state["terminal"] = "aborted"
+            return
+        if event_type == "task_complete":
+            if seen_turn and seen_turn != turn_id:
+                return
+            error = payload.get("error")
+            text = task_complete_error_text(error)
+            if error is not None and failure_is_retryable(text):
+                state["terminal"] = "failed"
+            else:
+                state["terminal"] = "completed"
+            return
+        return
+    if kind != "response_item" or not isinstance(payload, dict):
+        return
+    item_type = payload.get("type")
+    if item_type in CODEX_TOOL_TYPES or item_type in {
+        "reasoning",
+        "compaction",
+        "context_compaction",
+    }:
+        state["continued"] = True
+        return
+    if item_type == "message" and payload.get("role") == "assistant":
+        state["continued"] = True
+
+
+def decide_turn_watch(
+    state: dict[str, Any],
+    *,
+    lock_state: str,
+    now: float,
+    deadline: float,
+    idle_after_continuation: float | None,
+) -> str | None:
+    """返回 queue / skip / superseded；None 表示下一轮再看。
+
+    写锁还在，说明发起回合的进程没走。这时只认终态：可重试的
+    ``task_complete`` 才投递，正常结束和用户中断都不投递。锁松开之后，
+    没有新的模型输出才当作回合已经死掉。
+    """
+    terminal = state.get("terminal")
+    if terminal == "failed":
+        return "queue"
+    if terminal in {"completed", "aborted"}:
+        return "skip"
+    if terminal == "superseded":
+        return "superseded"
+    continued = bool(state.get("continued"))
+    if continued and lock_state != LOCK_HELD:
+        if idle_after_continuation is not None and now >= idle_after_continuation:
+            return "skip"
+        return None
+    if lock_state == LOCK_HELD or continued:
+        if now >= deadline:
+            return "skip"
+        return None
+    return "queue"
+
+
+def turn_watch_detail(decision: str, state: dict[str, Any]) -> str:
+    if decision == "superseded":
+        return SUPERSEDED_DURING_WATCH
+    if decision == "queue":
+        return QUEUE_TURN_FAILED if state.get("terminal") == "failed" else ""
+    if state.get("terminal") == "aborted":
+        return SKIP_TURN_ABORTED
+    if state.get("terminal") == "completed":
+        return SKIP_TURN_COMPLETED
+    if state.get("continued"):
+        return SKIP_TURN_CONTINUED
+    return SKIP_TURN_STILL_OPEN
+
+
+def read_jsonl_from(path: Path, offset: int) -> tuple[int, list[dict[str, Any]]]:
+    """从偏移读出已经写完的 JSONL 行，半行留到下一次。"""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if offset < 0 or offset > size:
+                offset = 0
+            if offset:
+                handle.seek(offset)
+            blob = handle.read()
+    except OSError:
+        return offset, []
+    if not blob:
+        return offset, []
+    if not blob.endswith(b"\n"):
+        newline = blob.rfind(b"\n")
+        if newline < 0:
+            return offset, []
+        complete = blob[: newline + 1]
+        new_offset = offset + newline + 1
+    else:
+        complete = blob
+        new_offset = offset + len(blob)
+    records: list[dict[str, Any]] = []
+    for line in complete.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return new_offset, records
+
+
+def stand_down_resume(job_id: str, event: str, detail: str) -> None:
+    """没投递续跑就停掉，并把这次失败次数退回去。"""
+    release_failure_attempt(job_id, states=STANDBY_RESUME_STATES)
+    update_resume_job(job_id, state="superseded", detail=detail)
+    log_resume_event(job_id, event, detail=detail)
+
+
+def watch_failed_turn(
+    session_id: str,
+    transcript_path: str | None,
+    turn_id: str | None,
+    *,
+    baseline_offset: int,
+    job_id: str,
+) -> tuple[str, str]:
+    """确认这次 API 失败是不是真的把回合打死了。
+
+    没有 rollout 或 turn_id 时无法观察，保持原来的投递行为。
+    ``DROID_AUTO_CONTINUE_TURN_WATCH_SECONDS=0`` 只看已经落盘的终态，不等。
+    """
+    if not transcript_path or not turn_id:
+        return "queue", ""
+    path = expand_path(transcript_path)
+    state: dict[str, Any] = {"continued": False, "terminal": None}
+    offset = baseline_offset if baseline_offset > 0 else 0
+    offset, records = read_jsonl_from(path, offset)
+    for record in records:
+        note_turn_activity(state, record, turn_id)
+    watch_seconds = turn_watch_seconds()
+    if watch_seconds <= 0:
+        decision = state.get("terminal")
+        if decision == "failed":
+            return "queue", QUEUE_TURN_FAILED
+        if decision == "superseded":
+            return "superseded", SUPERSEDED_DURING_WATCH
+        if decision in {"completed", "aborted"}:
+            return "skip", turn_watch_detail("skip", state)
+        return "queue", ""
+
+    deadline = time.monotonic() + watch_seconds
+    grace = max(1.0, lock_poll_seconds() * 2)
+    idle_after: float | None = None
+    announced = False
+    while True:
+        now = time.monotonic()
+        lock_state = thread_writer_lock_state(session_id)
+        if state.get("continued") and lock_state != LOCK_HELD:
+            if idle_after is None:
+                idle_after = now + grace
+        elif lock_state == LOCK_HELD:
+            idle_after = None
+        decision = decide_turn_watch(
+            state,
+            lock_state=lock_state,
+            now=now,
+            deadline=deadline,
+            idle_after_continuation=idle_after,
+        )
+        if decision is not None:
+            detail = turn_watch_detail(decision, state)
+            if decision == "queue" and detail:
+                log_resume_event(job_id, "turn_confirmed_failed", detail=detail)
+            return decision, detail
+        if not announced:
+            log_resume_event(
+                job_id,
+                "turn_still_active",
+                lock_state=lock_state,
+                continued=bool(state.get("continued")),
+            )
+            announced = True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            detail = turn_watch_detail("skip", state)
+            log_resume_event(job_id, "turn_watch_expired", detail=detail)
+            return "skip", detail
+        time.sleep(min(lock_poll_seconds(), remaining))
+        offset, records = read_jsonl_from(path, offset)
+        for record in records:
+            note_turn_activity(state, record, turn_id)
 
 
 def try_queue_resume(
@@ -2461,6 +2719,21 @@ def resume_after_lock(
         ):
             log_resume_event(job_id, "superseded_before_lock_wait")
             update_resume_job(job_id, state="superseded", detail="a new turn already started")
+            return 0
+
+        decision, watch_detail = watch_failed_turn(
+            session_id,
+            transcript_path,
+            turn_id,
+            baseline_offset=baseline_offset,
+            job_id=job_id,
+        )
+        if decision == "superseded":
+            log_resume_event(job_id, "superseded_before_lock_wait")
+            update_resume_job(job_id, state="superseded", detail=watch_detail)
+            return 0
+        if decision == "skip":
+            stand_down_resume(job_id, "turn_recovered_before_queue", watch_detail)
             return 0
 
         executable = codex_executable()
@@ -3394,13 +3667,19 @@ def claim_failure_attempt_with_job(
         connection.close()
 
 
-def release_failure_attempt(job_id: str) -> None:
-    """启动失败没有真正续跑，回退这次 API attempt。
+def release_failure_attempt(
+    job_id: str,
+    *,
+    states: frozenset[str] | None = None,
+) -> None:
+    """还没真正投递续跑时，回退这次 API attempt。
 
-    只回退仍处于 ``failed_to_launch`` 的 job，避免把已经成功启动、随后
-    失败的后台任务误算成没有发生。streaks 的 assistant_hash 只和这个 job
-    的错误指纹一致时才回退，防止并发 turn 互相改坏计数。
+    默认只回退 ``failed_to_launch``，避免把已经发出、随后失败的后台任务
+    误算成没有发生。同一回合自己恢复时，调用方会放宽到仍在等待的状态。
+    streaks 的 assistant_hash 只和这个 job 的错误指纹一致时才回退，防止
+    并发 turn 互相改坏计数。
     """
+    allowed = states if states is not None else frozenset({"failed_to_launch"})
     try:
         connection = connect()
     except (OSError, sqlite3.Error):
@@ -3411,7 +3690,7 @@ def release_failure_attempt(job_id: str) -> None:
             "SELECT scope_hash, error_hash, state FROM resume_jobs WHERE job_id = ?",
             (job_id,),
         ).fetchone()
-        if row is None or row[2] != "failed_to_launch":
+        if row is None or row[2] not in allowed:
             connection.commit()
             return
         scope_hash, error_hash, _ = row

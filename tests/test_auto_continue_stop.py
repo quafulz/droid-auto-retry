@@ -43,6 +43,7 @@ ENV_VARS = {
     "DROID_AUTO_CONTINUE_QUEUE_VERIFY_SECONDS",
     "DROID_AUTO_CONTINUE_QUEUE_TIMEOUT_SECONDS",
     "DROID_AUTO_CONTINUE_RESUME_TIMEOUT_SECONDS",
+    "DROID_AUTO_CONTINUE_TURN_WATCH_SECONDS",
 }
 
 
@@ -2802,6 +2803,272 @@ class FailureHookTests(unittest.TestCase):
         self.assertEqual(job_state, "queued")
         self.assertEqual(api_attempts, 1)
 
+    def hold_writer_lock(self, root: Path, session_id: str):
+        fcntl = __import__("fcntl")
+        home = root / "codex-home"
+        locks = home / "thread-writer-locks"
+        locks.mkdir(parents=True)
+        holder = (locks / f"{session_id}.lock").open("wb")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        return home, holder
+
+    def append_task_complete(
+        self,
+        transcript: Path,
+        turn_id: str,
+        *,
+        error: dict[str, object] | None = None,
+    ) -> None:
+        payload: dict[str, object] = {"type": "task_complete", "turn_id": turn_id}
+        if error is not None:
+            payload["error"] = error
+        else:
+            payload["last_agent_message"] = "本轮任务正常完成。"
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {"type": "event_msg", "payload": payload},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    def test_a_live_turn_that_completes_normally_is_not_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_started",
+                            "turn_id": "turn-failure-1",
+                        },
+                    }
+                ],
+            )
+            calls = write_fake_codex(root)
+            home, holder = self.hold_writer_lock(root, "session-failure-1")
+            try:
+                result = run_hook(
+                    {
+                        "hook_event_name": "PostModelRequest",
+                        "session_id": "session-failure-1",
+                        "turn_id": "turn-failure-1",
+                        "transcript_path": str(transcript),
+                        "cwd": str(root),
+                        "status": "failed",
+                        "error": "stream disconnected before completion",
+                    },
+                    root / "state",
+                    env_updates={
+                        "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                        "CODEX_HOME": str(home),
+                        "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                        "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS": "0.05",
+                        "DROID_AUTO_CONTINUE_TURN_WATCH_SECONDS": "3",
+                    },
+                )
+                with transcript.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {"type": "token_count"},
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    handle.write(
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "138/138 通过"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                self.append_task_complete(transcript, "turn-failure-1")
+                job_id, job_state, _, _ = self.wait_for_job(
+                    root / "state",
+                    states={"superseded"},
+                    detail_contains="completed without a retryable API error",
+                )
+                events = self.read_events(root / "state", job_id)
+                streak = self.streak_attempts(root / "state")
+            finally:
+                holder.close()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(calls.exists())
+        self.assertEqual(job_state, "superseded")
+        self.assertEqual(streak, 0)
+        self.assertIn(
+            "turn_recovered_before_queue",
+            [event["event"] for event in events],
+        )
+
+    def test_a_live_turn_that_ends_in_a_retryable_error_is_still_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            write_transcript(
+                transcript,
+                [
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_started",
+                            "turn_id": "turn-failure-1",
+                        },
+                    }
+                ],
+            )
+            calls = write_fake_codex(root)
+            home, holder = self.hold_writer_lock(root, "session-failure-1")
+            try:
+                result = run_hook(
+                    {
+                        "hook_event_name": "PostModelRequest",
+                        "session_id": "session-failure-1",
+                        "turn_id": "turn-failure-1",
+                        "transcript_path": str(transcript),
+                        "cwd": str(root),
+                        "status": "failed",
+                        "error": "exceeded retry limit, last status: 429 Too Many Requests",
+                    },
+                    root / "state",
+                    env_updates={
+                        "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+                        "CODEX_HOME": str(home),
+                        "DROID_AUTO_CONTINUE_FAILURE_BASE_DELAY": "0",
+                        "DROID_AUTO_CONTINUE_LOCK_POLL_SECONDS": "0.05",
+                        "DROID_AUTO_CONTINUE_QUEUE_SETTLE_SECONDS": "0.05",
+                        "DROID_AUTO_CONTINUE_TURN_WATCH_SECONDS": "3",
+                    },
+                )
+                self.append_task_complete(
+                    transcript,
+                    "turn-failure-1",
+                    error={
+                        "message": "exceeded retry limit, last status: 429 Too Many Requests",
+                    },
+                )
+                job_id, job_state, api_attempts, _ = self.wait_for_job(
+                    root / "state",
+                    states={"queued"},
+                    detail_contains="pending later rollout reconciliation",
+                )
+                recorded = self.wait_for_calls(calls)
+                streak = self.streak_attempts(root / "state")
+            finally:
+                holder.close()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([argv[:1] for argv in recorded], [["queue"]])
+        self.assertEqual((job_state, api_attempts, streak), ("queued", 1, 1))
+        self.assertTrue(job_id)
+
+
+class TurnWatchTests(unittest.TestCase):
+    def load(self):
+        spec = importlib.util.spec_from_file_location("turn_watch", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def decide(self, module, state: dict[str, object], lock_state: str) -> str | None:
+        return module.decide_turn_watch(
+            state,
+            lock_state=lock_state,
+            now=0,
+            deadline=10,
+            idle_after_continuation=None,
+        )
+
+    def test_token_count_is_not_recovery_and_a_held_lock_waits(self) -> None:
+        module = self.load()
+        state: dict[str, object] = {"continued": False, "terminal": None}
+        module.note_turn_activity(
+            state,
+            {"type": "event_msg", "payload": {"type": "token_count"}},
+            "turn-1",
+        )
+
+        self.assertFalse(state["continued"])
+        self.assertIsNone(self.decide(module, state, module.LOCK_HELD))
+        self.assertEqual(self.decide(module, state, module.LOCK_FREE), "queue")
+
+    def test_a_clean_completion_skips_while_the_writer_is_still_held(self) -> None:
+        module = self.load()
+        state: dict[str, object] = {"continued": False, "terminal": None}
+        module.note_turn_activity(
+            state,
+            {
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant"},
+            },
+            "turn-1",
+        )
+        module.note_turn_activity(
+            state,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-1",
+                    "last_agent_message": "done",
+                },
+            },
+            "turn-1",
+        )
+
+        self.assertEqual(self.decide(module, state, module.LOCK_HELD), "skip")
+        self.assertEqual(
+            module.turn_watch_detail("skip", state),
+            module.SKIP_TURN_COMPLETED,
+        )
+
+    def test_a_retryable_completion_still_queues_while_the_writer_is_held(self) -> None:
+        module = self.load()
+        state: dict[str, object] = {"continued": False, "terminal": None}
+        module.note_turn_activity(
+            state,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-1",
+                    "error": {"message": "last status: 503"},
+                },
+            },
+            "turn-1",
+        )
+
+        self.assertEqual(self.decide(module, state, module.LOCK_HELD), "queue")
+
+    def test_an_aborted_turn_is_not_resumed(self) -> None:
+        module = self.load()
+        state: dict[str, object] = {"continued": False, "terminal": None}
+        module.note_turn_activity(
+            state,
+            {
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "turn_id": "turn-1"},
+            },
+            "turn-1",
+        )
+
+        self.assertEqual(self.decide(module, state, module.LOCK_HELD), "skip")
+
 
 class DroidFailureStopTests(unittest.TestCase):
     """Droid 的 429 会进入 Stop，错误已经在 transcript 里。"""
@@ -3389,14 +3656,11 @@ class ResumeHelperTests(unittest.TestCase):
                     "SELECT state FROM resume_jobs WHERE job_id = ?",
                     ("job-superseded",),
                 ).fetchone()[0]
-            recorded = [
-                json.loads(line)
-                for line in calls.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
 
+        # 写锁还在、回合也没以可重试错误结束时，不能先把续跑塞进队列。
+        # 新 turn 出现后直接停，queue 和 exec 都不会发出去。
         self.assertEqual(job_state, "superseded")
-        self.assertEqual([argv[:1] for argv in recorded], [["queue"]])
+        self.assertFalse(calls.exists())
 
     def test_helper_records_an_active_writer_timeout(self) -> None:
         fcntl = __import__("fcntl")
