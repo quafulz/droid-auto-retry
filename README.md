@@ -44,11 +44,28 @@ codex plugin marketplace add https://github.com/quafulz/droid-auto-retry
 codex plugin add custom-model-stop-patch@droid-auto-retry
 ```
 
+### 更新
+
+**Droid：**
+
+```bash
+droid plugin update custom-model-stop-patch@droid-auto-retry
+```
+
+**Codex：**
+
+先刷新 marketplace，再按最新快照重新安装：
+
+```bash
+codex plugin marketplace upgrade droid-auto-retry
+codex plugin add custom-model-stop-patch@droid-auto-retry
+```
+
 ### 使用与验证
 
 安装完成后，**新开一个会话**即可自动生效（无需修改日常使用方式）：
 
-- 在 **Droid** 中可通过 `/hooks` 确认 Stop hook 已启用；后续通过 `droid plugin update` 更新插件通常无需重启会话。
+- 在 **Droid** 中可通过 `/hooks` 确认 Stop hook 已启用；用上面的 `droid plugin update` 更新后，通常不用重开会话。
 - 在 **Codex** 中安装或更新后建议新开一个会话。
 - 如需调整最大重试次数、退避时间或状态目录等行为，可通过环境变量配置。
 
